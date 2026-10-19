@@ -1,0 +1,2883 @@
+<roblox version="4">
+  <Item class="Script" referent="0">
+    <Properties>
+      <string name="Name">SvgMeshImporter</string>
+      <token name="RunContext">0</token>
+      <string name="Source"><![CDATA[-- SVG Mesh Importer: builds extruded MeshParts from an SVG file, then uploads them as Mesh assets
+-- so they survive saving and publishing.
+
+local ChangeHistoryService = game:GetService("ChangeHistoryService")
+local Selection = game:GetService("Selection")
+local StudioService = game:GetService("StudioService")
+
+local SvgDocument = require(script.SvgDocument)
+local MeshBuilder = require(script.MeshBuilder)
+local MeshEmitter = require(script.MeshEmitter)
+
+-- Curve tolerance as a fraction of the SVG's size.
+local QUALITY = { Low = 0.004, Medium = 0.0015, High = 0.0006, Ultra = 0.00025 }
+local QUALITY_ORDER = { "Low", "Medium", "High", "Ultra" }
+local COLLISION_ORDER = { "Box", "Hull", "Default", "PreciseConvexDecomposition" }
+
+local ASSET_ATTRIBUTE = "SvgMeshAssetId"
+local PENDING_ATTRIBUTE = "SvgMeshPendingAssetId"
+
+local DEFAULTS = {
+	width = 10,
+	thickness = 0.5,
+	layerGap = 0.01,
+	quality = "Medium",
+	collision = "Hull",
+	groupId = "",
+}
+
+local config = {}
+for key, default in DEFAULTS do
+	local saved = plugin:GetSetting("SvgMeshImporter_" .. key)
+	config[key] = if typeof(saved) == typeof(default) then saved else default
+end
+
+if not table.find(QUALITY_ORDER, config.quality) then
+	config.quality = DEFAULTS.quality
+end
+if not table.find(COLLISION_ORDER, config.collision) then
+	config.collision = DEFAULTS.collision
+end
+
+local function setConfig(key: string, value: any)
+	config[key] = value
+	plugin:SetSetting("SvgMeshImporter_" .. key, value)
+end
+
+local state = {
+	source = nil :: string?,
+	fileName = "SVG",
+	parsed = nil :: any,
+	parsedQuality = nil :: number?,
+	model = nil :: Model?,
+	busy = false,
+}
+
+-- EditableMeshes behind preview parts. Kept alive for the session so undo/redo of a preview
+-- still has geometry to show; released once a part points at an uploaded asset.
+local editableMeshes: { [MeshPart]: EditableMesh } = {}
+
+---------------------------------------------------------------------------------------------------
+-- UI: Granny Tower house style (tinted stud tiles, black outer stroke, white bevel inner stroke,
+-- Comic Neue Angular Bold with outlined white text).
+
+local FRAME_TEXTURE = "rbxassetid://2953645289"
+local FRAME_TILE = UDim2.fromOffset(40, 40)
+local FONT = Font.new("rbxasset://fonts/families/ComicNeueAngular.json", Enum.FontWeight.Bold)
+local ICON = "rbxassetid://82464155361999"
+
+local TINTS = {
+	page = Color3.fromRGB(70, 74, 92),
+	card = Color3.fromRGB(90, 170, 255),
+	choose = Color3.fromRGB(255, 200, 35),
+	rebuild = Color3.fromRGB(190, 120, 255),
+	save = Color3.fromRGB(95, 215, 115),
+	cycle = Color3.fromRGB(190, 120, 255),
+	input = Color3.fromRGB(28, 30, 38),
+	info = Color3.fromRGB(90, 170, 255),
+	warning = Color3.fromRGB(255, 200, 35),
+	error = Color3.fromRGB(255, 75, 75),
+	success = Color3.fromRGB(95, 215, 115),
+}
+
+local toolbar = plugin:CreateToolbar("SVG Mesh Importer")
+local toggleButton = toolbar:CreateButton("SvgMeshImporterToggle", "Import an SVG file as an extruded mesh", ICON, "SVG Import")
+toggleButton.ClickableWhenViewportHidden = true
+
+local widgetInfo = DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Float, false, false, 320, 560, 280, 360)
+local widget = plugin:CreateDockWidgetPluginGui("SvgMeshImporter", widgetInfo)
+widget.Title = "SVG Mesh Importer"
+widget.Name = "SvgMeshImporter"
+
+toggleButton.Click:Connect(function()
+	widget.Enabled = not widget.Enabled
+end)
+widget:GetPropertyChangedSignal("Enabled"):Connect(function()
+	toggleButton:SetActive(widget.Enabled)
+end)
+
+local function bevelGradient(tint: Color3): ColorSequence
+	return ColorSequence.new({
+		ColorSequenceKeypoint.new(0, tint:Lerp(Color3.new(0, 0, 0), 0.45)),
+		ColorSequenceKeypoint.new(0.455959, tint),
+		ColorSequenceKeypoint.new(1, Color3.new(1, 1, 1)),
+	})
+end
+
+-- Turns an ImageLabel/ImageButton into a tinted stud panel. Returns a function that re-tints it.
+local function studFrame(frame: ImageLabel | ImageButton, tint: Color3): (Color3) -> ()
+	frame.BackgroundTransparency = 1
+	frame.Image = FRAME_TEXTURE
+	frame.ScaleType = Enum.ScaleType.Tile
+	frame.TileSize = FRAME_TILE
+	frame.ImageColor3 = tint
+
+	local outer = Instance.new("UIStroke")
+	outer.Name = "Outer"
+	outer.Thickness = 4
+	outer.Color = Color3.new(0, 0, 0)
+	outer.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+	outer.Parent = frame
+
+	local inner = Instance.new("UIStroke")
+	inner.Name = "Inner"
+	inner.Thickness = 3
+	inner.Color = Color3.new(1, 1, 1)
+	inner.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+	pcall(function()
+		inner.BorderStrokePosition = Enum.BorderStrokePosition.Inner
+	end)
+	inner.Parent = frame
+
+	local gradient = Instance.new("UIGradient")
+	gradient.Rotation = 270
+	gradient.Color = bevelGradient(tint)
+	gradient.Parent = inner
+
+	return function(newTint: Color3)
+		frame.ImageColor3 = newTint
+		gradient.Color = bevelGradient(newTint)
+	end
+end
+
+local function makeText(parent: Instance, text: string, size: number?): TextLabel
+	local label = Instance.new("TextLabel")
+	label.BackgroundTransparency = 1
+	label.FontFace = FONT
+	label.TextSize = size or 16
+	label.TextColor3 = Color3.new(1, 1, 1)
+	label.TextWrapped = true
+	label.TextXAlignment = Enum.TextXAlignment.Left
+	label.TextYAlignment = Enum.TextYAlignment.Center
+	label.Text = text
+	local stroke = Instance.new("UIStroke")
+	stroke.Thickness = 2
+	stroke.Color = Color3.new(0, 0, 0)
+	stroke.LineJoinMode = Enum.LineJoinMode.Round
+	stroke.Parent = label
+	label.Parent = parent
+	return label
+end
+
+local function makeList(parent: Instance, gap: number, pad: number)
+	local list = Instance.new("UIListLayout")
+	list.SortOrder = Enum.SortOrder.LayoutOrder
+	list.Padding = UDim.new(0, gap)
+	list.Parent = parent
+	local padding = Instance.new("UIPadding")
+	padding.PaddingTop = UDim.new(0, pad)
+	padding.PaddingBottom = UDim.new(0, pad)
+	padding.PaddingLeft = UDim.new(0, pad)
+	padding.PaddingRight = UDim.new(0, pad)
+	padding.Parent = parent
+end
+
+local nextOrder = 0
+local function order(): number
+	nextOrder += 1
+	return nextOrder
+end
+
+local function makeButton(parent: Instance, text: string, tint: Color3, height: number?): (ImageButton, TextLabel)
+	local button = Instance.new("ImageButton")
+	button.AutoButtonColor = false
+	button.Size = UDim2.new(1, 0, 0, height or 38)
+	button.LayoutOrder = order()
+	local setTint = studFrame(button, tint)
+	local label = makeText(button, text, 18)
+	label.Size = UDim2.fromScale(1, 1)
+	label.TextXAlignment = Enum.TextXAlignment.Center
+	button.MouseEnter:Connect(function()
+		setTint(tint:Lerp(Color3.new(1, 1, 1), 0.15))
+	end)
+	button.MouseLeave:Connect(function()
+		setTint(tint)
+	end)
+	button.MouseButton1Down:Connect(function()
+		setTint(tint:Lerp(Color3.new(0, 0, 0), 0.2))
+	end)
+	button.MouseButton1Up:Connect(function()
+		setTint(tint:Lerp(Color3.new(1, 1, 1), 0.15))
+	end)
+	button.Parent = parent
+	return button, label
+end
+
+local function makeCard(parent: Instance, tint: Color3): (ImageLabel, (Color3) -> ())
+	local card = Instance.new("ImageLabel")
+	card.Size = UDim2.new(1, 0, 0, 0)
+	card.AutomaticSize = Enum.AutomaticSize.Y
+	card.LayoutOrder = order()
+	local setTint = studFrame(card, tint)
+	makeList(card, 8, 12)
+	card.Parent = parent
+	return card, setTint
+end
+
+-- Page: a dark stud backdrop behind a transparent scrolling column.
+local backdrop = Instance.new("ImageLabel")
+backdrop.Size = UDim2.fromScale(1, 1)
+backdrop.BackgroundColor3 = TINTS.page
+backdrop.Image = FRAME_TEXTURE
+backdrop.ScaleType = Enum.ScaleType.Tile
+backdrop.TileSize = FRAME_TILE
+backdrop.ImageColor3 = TINTS.page
+backdrop.BorderSizePixel = 0
+backdrop.Parent = widget
+
+local root = Instance.new("ScrollingFrame")
+root.Size = UDim2.fromScale(1, 1)
+root.BackgroundTransparency = 1
+root.BorderSizePixel = 0
+root.ScrollBarThickness = 6
+root.ScrollBarImageColor3 = Color3.new(0, 0, 0)
+root.CanvasSize = UDim2.new()
+root.AutomaticCanvasSize = Enum.AutomaticSize.Y
+root.ScrollingDirection = Enum.ScrollingDirection.Y
+root.Parent = backdrop
+makeList(root, 12, 14)
+
+local onSettingsChanged: () -> ()
+
+local function makeRow(parent: Instance, labelText: string): Frame
+	local row = Instance.new("Frame")
+	row.BackgroundTransparency = 1
+	row.Size = UDim2.new(1, 0, 0, 30)
+	row.LayoutOrder = order()
+	local label = makeText(row, labelText)
+	label.Size = UDim2.new(0.55, -6, 1, 0)
+	row.Parent = parent
+	return row
+end
+
+local function makeInput(row: Frame): TextBox
+	local box = Instance.new("TextBox")
+	box.Size = UDim2.new(0.45, 0, 1, 0)
+	box.Position = UDim2.fromScale(0.55, 0)
+	box.BackgroundColor3 = TINTS.input
+	box.ClearTextOnFocus = false
+	box.FontFace = FONT
+	box.TextSize = 16
+	box.TextColor3 = Color3.new(1, 1, 1)
+	box.PlaceholderColor3 = Color3.fromRGB(140, 145, 160)
+	box.TextXAlignment = Enum.TextXAlignment.Left
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 6)
+	corner.Parent = box
+	local stroke = Instance.new("UIStroke")
+	stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+	stroke.Thickness = 2
+	stroke.Color = Color3.new(0, 0, 0)
+	stroke.Parent = box
+	local inner = Instance.new("UIPadding")
+	inner.PaddingLeft = UDim.new(0, 8)
+	inner.Parent = box
+	box.Parent = row
+	return box
+end
+
+local function numberSetting(parent: Instance, labelText: string, key: string, min: number, max: number)
+	local box = makeInput(makeRow(parent, labelText))
+	box.Text = tostring(config[key])
+	box.FocusLost:Connect(function()
+		local value = tonumber(box.Text)
+		if value and value == value then
+			value = math.clamp(value, min, max)
+			if value ~= config[key] then
+				setConfig(key, value)
+				onSettingsChanged()
+			end
+		end
+		box.Text = tostring(config[key])
+	end)
+end
+
+local function cycleSetting(parent: Instance, labelText: string, key: string, options: { string }, rebuild: boolean)
+	local row = makeRow(parent, labelText)
+	local button, label = makeButton(row, config[key], TINTS.cycle, 30)
+	button.Size = UDim2.new(0.45, 0, 1, 0)
+	button.Position = UDim2.fromScale(0.55, 0)
+	label.TextSize = 16
+	button.Activated:Connect(function()
+		local index = table.find(options, config[key]) or 0
+		setConfig(key, options[index % #options + 1])
+		label.Text = config[key]
+		if rebuild then
+			onSettingsChanged()
+		end
+	end)
+end
+
+-- File
+local chooseButton = makeButton(root, "Choose SVG file…", TINTS.choose, 42)
+
+local fileLabel = makeText(root, "No file chosen", 15)
+fileLabel.Size = UDim2.new(1, 0, 0, 18)
+fileLabel.TextTruncate = Enum.TextTruncate.AtEnd
+fileLabel.LayoutOrder = order()
+
+-- Settings
+local settingsCard = makeCard(root, TINTS.card)
+local settingsHeader = makeText(settingsCard, "Settings", 20)
+settingsHeader.Size = UDim2.new(1, 0, 0, 24)
+settingsHeader.LayoutOrder = order()
+numberSetting(settingsCard, "Width (studs)", "width", 0.05, 2048)
+numberSetting(settingsCard, "Thickness (studs)", "thickness", 0, 512)
+numberSetting(settingsCard, "Layer gap (studs)", "layerGap", 0, 10)
+cycleSetting(settingsCard, "Curve quality", "quality", QUALITY_ORDER, true)
+cycleSetting(settingsCard, "Collision", "collision", COLLISION_ORDER, false)
+
+local groupBox = makeInput(makeRow(settingsCard, "Upload to group ID"))
+groupBox.PlaceholderText = "optional"
+groupBox.Text = config.groupId
+groupBox.FocusLost:Connect(function()
+	local digits = groupBox.Text:match("^%s*(%d+)%s*$") or ""
+	setConfig("groupId", digits)
+	groupBox.Text = digits
+end)
+
+-- Actions
+local rebuildButton = makeButton(root, "Rebuild preview", TINTS.rebuild)
+local saveButton = makeButton(root, "Save as mesh assets", TINTS.save, 42)
+
+-- Status
+local statusCard, setStatusTint = makeCard(root, TINTS.info)
+local status = makeText(statusCard, "", 15)
+status.Size = UDim2.new(1, 0, 0, 0)
+status.AutomaticSize = Enum.AutomaticSize.Y
+status.TextYAlignment = Enum.TextYAlignment.Top
+
+local function setStatus(text: string, kind: string?)
+	status.Text = text
+	setStatusTint(TINTS[kind or "info"] or TINTS.info)
+end
+
+setStatus("Choose an SVG to get started. Filled shapes become parts, one per fill color.")
+
+---------------------------------------------------------------------------------------------------
+-- Actions
+
+local function collisionFidelity(): Enum.CollisionFidelity
+	return Enum.CollisionFidelity[config.collision]
+end
+
+local function isUploaded(part: Instance): boolean
+	return part:GetAttribute(ASSET_ATTRIBUTE) ~= nil
+end
+
+local function hasPreviewParts(model: Instance): boolean
+	for _, d in model:GetDescendants() do
+		if d:IsA("MeshPart") and editableMeshes[d] and not isUploaded(d) then
+			return true
+		end
+	end
+	return false
+end
+
+-- A preview nothing has been uploaded from yet, which is safe to throw away and rebuild.
+local function isFreshPreview(model: Instance?): boolean
+	if not model or not model.Parent then
+		return false
+	end
+	local any = false
+	for _, d in model:GetDescendants() do
+		if d:IsA("MeshPart") then
+			if isUploaded(d) or d:GetAttribute(PENDING_ATTRIBUTE) or not editableMeshes[d] then
+				return false
+			end
+			any = true
+		end
+	end
+	return any
+end
+
+-- In front of the camera, facing it, so the SVG reads correctly.
+local function placementCFrame(width: number): CFrame
+	local camera = workspace.CurrentCamera
+	local look = camera.CFrame.LookVector
+	local position = camera.CFrame.Position + look * (width * 1.2 + 4)
+	local flat = Vector3.new(look.X, 0, look.Z)
+	local toCamera = if flat.Magnitude > 1e-3 then -flat.Unit else Vector3.new(0, 0, 1)
+	return CFrame.lookAt(position, position + toCamera)
+end
+
+local function formatNumber(n: number): string
+	return tostring(math.round(n * 100) / 100)
+end
+
+local function rebuild()
+	if state.busy then
+		return
+	end
+	if not state.source then
+		setStatus("Choose an SVG file first.", "warning")
+		return
+	end
+	state.busy = true
+	setStatus("Building…")
+
+	local ok, err = pcall(function()
+		local quality = QUALITY[config.quality] or QUALITY.Medium
+		if not state.parsed or state.parsedQuality ~= quality then
+			state.parsed = SvgDocument.load(state.source :: string, quality)
+			state.parsedQuality = quality
+		end
+		local built = MeshBuilder.build(state.parsed.shapes, {
+			width = config.width,
+			thickness = config.thickness,
+			layerGap = config.layerGap,
+		})
+
+		local model = Instance.new("Model")
+		model.Name = "SVG_" .. state.fileName
+		for index, data in built.meshes do
+			setStatus(("Building part %d of %d…"):format(index, #built.meshes))
+			local mesh = MeshEmitter.createEditableMesh(data)
+			local part = MeshEmitter.createPart(data, mesh, collisionFidelity())
+			part.CFrame = CFrame.new(data.center[1], data.center[2], data.center[3])
+			part.Parent = model
+			editableMeshes[part] = mesh
+			task.wait()
+		end
+		model.WorldPivot = CFrame.identity
+
+		-- Replace the previous preview in place unless it has already been saved.
+		local old = state.model
+		local pivot
+		if isFreshPreview(old) then
+			pivot = old:GetPivot()
+		else
+			pivot = placementCFrame(config.width)
+			old = nil
+		end
+		model:PivotTo(pivot)
+
+		local recording = ChangeHistoryService:TryBeginRecording("Import SVG")
+		if old then
+			old.Parent = nil
+		end
+		model.Parent = workspace
+		if recording then
+			ChangeHistoryService:FinishRecording(recording, Enum.FinishRecordingOperation.Commit)
+		end
+		state.model = model
+		Selection:Set({ model })
+
+		local lines = {
+			("Preview built: %d part(s), %d triangles, %s × %s studs."):format(
+				#built.meshes,
+				built.triangles,
+				formatNumber(built.width),
+				formatNumber(built.height)
+			),
+			"This preview isn't saved with the place yet. Click Save as mesh assets to make it permanent.",
+		}
+		local warnings = table.clone(state.parsed.warnings)
+		table.move(built.warnings, 1, #built.warnings, #warnings + 1, warnings)
+		for _, w in warnings do
+			table.insert(lines, "• " .. w)
+		end
+		setStatus(table.concat(lines, "\n"), if #warnings > 0 then "warning" else nil)
+	end)
+
+	state.busy = false
+	if not ok then
+		setStatus("Couldn't build the mesh: " .. tostring(err), "error")
+	end
+end
+
+onSettingsChanged = function()
+	-- Only live-update while the current preview is unsaved; never touch uploaded parts.
+	if state.source and isFreshPreview(state.model) then
+		rebuild()
+	end
+end
+
+local function chooseFile()
+	if state.busy then
+		return
+	end
+	local ok, file = pcall(function()
+		return StudioService:PromptImportFileAsync({ "svg" })
+	end)
+	if not ok then
+		setStatus("Couldn't open the file: " .. tostring(file), "error")
+		return
+	end
+	if not file then
+		return
+	end
+	state.source = file:GetBinaryContents()
+	state.fileName = (file.Name:gsub("%.[sS][vV][gG]$", ""))
+	state.parsed = nil
+	state.model = nil -- keep any earlier import in the scene; this file gets a new model
+	fileLabel.Text = file.Name
+	rebuild()
+end
+
+local function saveAssets()
+	if state.busy then
+		return
+	end
+	-- Save the selected SVG model if it has unsaved parts, otherwise the latest preview.
+	local target: Instance? = nil
+	for _, selected in Selection:Get() do
+		local model = if selected:IsA("Model") then selected else selected:FindFirstAncestorOfClass("Model")
+		if model and hasPreviewParts(model) then
+			target = model
+			break
+		end
+	end
+	if not target and state.model and state.model.Parent and hasPreviewParts(state.model) then
+		target = state.model
+	end
+	if not target then
+		setStatus("Nothing to save. Build a preview first (or select an unsaved SVG model).", "warning")
+		return
+	end
+
+	local parts = {}
+	for _, d in (target :: Instance):GetDescendants() do
+		if d:IsA("MeshPart") and editableMeshes[d] and not isUploaded(d) then
+			table.insert(parts, d)
+		end
+	end
+	table.sort(parts, function(a, b)
+		return a.Name < b.Name
+	end)
+
+	state.busy = true
+	local groupId = tonumber(config.groupId)
+	local saved, failures = 0, {}
+	local recording = ChangeHistoryService:TryBeginRecording("Save SVG meshes")
+	for index, part in parts do
+		setStatus(("Uploading mesh %d of %d…"):format(index, #parts))
+		local assetId = part:GetAttribute(PENDING_ATTRIBUTE)
+		if not assetId then
+			local assetName = ((target :: Instance).Name .. "_" .. part.Name):sub(1, 50)
+			local id, err = MeshEmitter.upload(editableMeshes[part], assetName, groupId)
+			if not id then
+				table.insert(failures, part.Name .. ": " .. tostring(err))
+				continue
+			end
+			assetId = id
+			part:SetAttribute(PENDING_ATTRIBUTE, id)
+		end
+		setStatus(("Applying mesh %d of %d (asset %d)…"):format(index, #parts, assetId))
+		local applied, err = MeshEmitter.applyAsset(part, assetId, collisionFidelity())
+		if applied then
+			part:SetAttribute(ASSET_ATTRIBUTE, assetId)
+			part:SetAttribute(PENDING_ATTRIBUTE, nil)
+			editableMeshes[part] = nil
+			saved += 1
+		else
+			table.insert(failures, ("%s: uploaded as %d but couldn't load it yet (%s)"):format(part.Name, assetId, tostring(err)))
+		end
+	end
+	if recording then
+		ChangeHistoryService:FinishRecording(recording, Enum.FinishRecordingOperation.Commit)
+	end
+	state.busy = false
+
+	if #failures == 0 then
+		setStatus(("Saved %d mesh asset(s). The model now uses uploaded meshes and will save with the place."):format(saved), "success")
+	else
+		setStatus(
+			("Saved %d of %d. Click Save again to retry the rest:\n• %s"):format(saved, #parts, table.concat(failures, "\n• ")),
+			"error"
+		)
+	end
+end
+
+chooseButton.Activated:Connect(chooseFile)
+rebuildButton.Activated:Connect(rebuild)
+saveButton.Activated:Connect(saveAssets)
+]]></string>
+    </Properties>
+    <Item class="ModuleScript" referent="1">
+      <Properties>
+        <string name="Name">Earcut</string>
+        <string name="Source"><![CDATA[-- Polygon triangulation with holes: a Luau port of Mapbox's earcut algorithm (ISC license,
+-- https://github.com/mapbox/earcut). Vertices are 1-based indices into xs/ys.
+
+local Earcut = {}
+
+type Node = {
+	i: number,
+	x: number,
+	y: number,
+	prev: Node,
+	next: Node,
+	z: number,
+	prevZ: Node?,
+	nextZ: Node?,
+	steiner: boolean,
+}
+
+local function newNode(i: number, x: number, y: number): Node
+	return { i = i, x = x, y = y, prev = nil :: any, next = nil :: any, z = 0, prevZ = nil, nextZ = nil, steiner = false }
+end
+
+local function insertNode(i: number, x: number, y: number, last: Node?): Node
+	local p = newNode(i, x, y)
+	if not last then
+		p.prev = p
+		p.next = p
+	else
+		p.next = last.next
+		p.prev = last
+		last.next.prev = p
+		last.next = p
+	end
+	return p
+end
+
+local function removeNode(p: Node)
+	p.next.prev = p.prev
+	p.prev.next = p.next
+	if p.prevZ then
+		(p.prevZ :: Node).nextZ = p.nextZ
+	end
+	if p.nextZ then
+		(p.nextZ :: Node).prevZ = p.prevZ
+	end
+end
+
+local function area(p: Node, q: Node, r: Node): number
+	return (q.y - p.y) * (r.x - q.x) - (q.x - p.x) * (r.y - q.y)
+end
+
+local function equals(a: Node, b: Node): boolean
+	return a.x == b.x and a.y == b.y
+end
+
+local function sign(n: number): number
+	return if n > 0 then 1 elseif n < 0 then -1 else 0
+end
+
+local function onSegment(p: Node, q: Node, r: Node): boolean
+	return q.x <= math.max(p.x, r.x) and q.x >= math.min(p.x, r.x) and q.y <= math.max(p.y, r.y) and q.y >= math.min(p.y, r.y)
+end
+
+local function intersects(p1: Node, q1: Node, p2: Node, q2: Node): boolean
+	local o1 = sign(area(p1, q1, p2))
+	local o2 = sign(area(p1, q1, q2))
+	local o3 = sign(area(p2, q2, p1))
+	local o4 = sign(area(p2, q2, q1))
+	if o1 ~= o2 and o3 ~= o4 then
+		return true
+	end
+	if o1 == 0 and onSegment(p1, p2, q1) then
+		return true
+	end
+	if o2 == 0 and onSegment(p1, q2, q1) then
+		return true
+	end
+	if o3 == 0 and onSegment(p2, p1, q2) then
+		return true
+	end
+	if o4 == 0 and onSegment(p2, q1, q2) then
+		return true
+	end
+	return false
+end
+
+local function pointInTriangle(ax: number, ay: number, bx: number, by: number, cx: number, cy: number, px: number, py: number): boolean
+	return (cx - px) * (ay - py) >= (ax - px) * (cy - py)
+		and (ax - px) * (by - py) >= (bx - px) * (ay - py)
+		and (bx - px) * (cy - py) >= (cx - px) * (by - py)
+end
+
+local function intersectsPolygon(a: Node, b: Node): boolean
+	local p = a
+	repeat
+		if p.i ~= a.i and p.next.i ~= a.i and p.i ~= b.i and p.next.i ~= b.i and intersects(p, p.next, a, b) then
+			return true
+		end
+		p = p.next
+	until p == a
+	return false
+end
+
+local function locallyInside(a: Node, b: Node): boolean
+	if area(a.prev, a, a.next) < 0 then
+		return area(a, b, a.next) >= 0 and area(a, a.prev, b) >= 0
+	end
+	return area(a, b, a.prev) < 0 or area(a, a.next, b) < 0
+end
+
+local function middleInside(a: Node, b: Node): boolean
+	local p = a
+	local inside = false
+	local px, py = (a.x + b.x) / 2, (a.y + b.y) / 2
+	repeat
+		if ((p.y > py) ~= (p.next.y > py)) and p.next.y ~= p.y and (px < (p.next.x - p.x) * (py - p.y) / (p.next.y - p.y) + p.x) then
+			inside = not inside
+		end
+		p = p.next
+	until p == a
+	return inside
+end
+
+local function isValidDiagonal(a: Node, b: Node): boolean
+	return a.next.i ~= b.i
+		and a.prev.i ~= b.i
+		and not intersectsPolygon(a, b)
+		and (
+			(locallyInside(a, b) and locallyInside(b, a) and middleInside(a, b) and (area(a.prev, a, b.prev) ~= 0 or area(a, b.prev, b) ~= 0))
+			or (equals(a, b) and area(a.prev, a, a.next) > 0 and area(b.prev, b, b.next) > 0)
+		)
+end
+
+-- Links a with b by splitting the ring in two; returns the new node on b's side.
+local function splitPolygon(a: Node, b: Node): Node
+	local a2 = newNode(a.i, a.x, a.y)
+	local b2 = newNode(b.i, b.x, b.y)
+	local an = a.next
+	local bp = b.prev
+	a.next = b
+	b.prev = a
+	a2.next = an
+	an.prev = a2
+	b2.next = a2
+	a2.prev = b2
+	bp.next = b2
+	b2.prev = bp
+	return b2
+end
+
+local function signedArea(xs: { number }, ys: { number }, s: number, e: number): number
+	local sum = 0
+	local j = e
+	for i = s, e do
+		sum += (xs[j] - xs[i]) * (ys[i] + ys[j])
+		j = i
+	end
+	return sum
+end
+
+local function linkedList(xs: { number }, ys: { number }, s: number, e: number, clockwise: boolean): Node?
+	local last: Node? = nil
+	if clockwise == (signedArea(xs, ys, s, e) > 0) then
+		for i = s, e do
+			last = insertNode(i, xs[i], ys[i], last)
+		end
+	else
+		for i = e, s, -1 do
+			last = insertNode(i, xs[i], ys[i], last)
+		end
+	end
+	if last and equals(last, last.next) then
+		removeNode(last)
+		last = last.next
+	end
+	return last
+end
+
+-- Removes duplicate and collinear points.
+local function filterPoints(start: Node?, finish: Node?): Node?
+	if not start then
+		return start
+	end
+	local stop = finish or start
+	local p = start
+	local again
+	repeat
+		again = false
+		if not p.steiner and (equals(p, p.next) or area(p.prev, p, p.next) == 0) then
+			removeNode(p)
+			p = p.prev
+			stop = p
+			if p == p.next then
+				break
+			end
+			again = true
+		else
+			p = p.next
+		end
+	until not (again or p ~= stop)
+	return stop
+end
+
+local function zOrder(x: number, y: number, minX: number, minY: number, invSize: number): number
+	local ix = math.clamp(math.floor((x - minX) * invSize), 0, 32767)
+	local iy = math.clamp(math.floor((y - minY) * invSize), 0, 32767)
+	ix = bit32.band(bit32.bor(ix, bit32.lshift(ix, 8)), 0x00FF00FF)
+	ix = bit32.band(bit32.bor(ix, bit32.lshift(ix, 4)), 0x0F0F0F0F)
+	ix = bit32.band(bit32.bor(ix, bit32.lshift(ix, 2)), 0x33333333)
+	ix = bit32.band(bit32.bor(ix, bit32.lshift(ix, 1)), 0x55555555)
+	iy = bit32.band(bit32.bor(iy, bit32.lshift(iy, 8)), 0x00FF00FF)
+	iy = bit32.band(bit32.bor(iy, bit32.lshift(iy, 4)), 0x0F0F0F0F)
+	iy = bit32.band(bit32.bor(iy, bit32.lshift(iy, 2)), 0x33333333)
+	iy = bit32.band(bit32.bor(iy, bit32.lshift(iy, 1)), 0x55555555)
+	return bit32.bor(ix, bit32.lshift(iy, 1))
+end
+
+-- Simon Tatham's linked-list merge sort, on the z-order links.
+local function sortLinked(list: Node?)
+	local inSize = 1
+	local numMerges
+	repeat
+		local p = list
+		list = nil
+		local tail: Node? = nil
+		numMerges = 0
+		while p do
+			numMerges += 1
+			local q: Node? = p
+			local pSize = 0
+			for _ = 1, inSize do
+				pSize += 1
+				q = (q :: Node).nextZ
+				if not q then
+					break
+				end
+			end
+			local qSize = inSize
+			while pSize > 0 or (qSize > 0 and q) do
+				local e: Node
+				if pSize ~= 0 and (qSize == 0 or not q or (p :: Node).z <= (q :: Node).z) then
+					e = p :: Node
+					p = e.nextZ
+					pSize -= 1
+				else
+					e = q :: Node
+					q = e.nextZ
+					qSize -= 1
+				end
+				if tail then
+					tail.nextZ = e
+				else
+					list = e
+				end
+				e.prevZ = tail
+				tail = e
+			end
+			p = q
+		end
+		if tail then
+			tail.nextZ = nil
+		end
+		inSize *= 2
+	until numMerges <= 1
+end
+
+local function indexCurve(start: Node, minX: number, minY: number, invSize: number)
+	local p = start
+	repeat
+		if p.z == 0 then
+			p.z = zOrder(p.x, p.y, minX, minY, invSize)
+		end
+		p.prevZ = p.prev
+		p.nextZ = p.next
+		p = p.next
+	until p == start
+	local tail = p.prevZ :: Node
+	tail.nextZ = nil
+	p.prevZ = nil
+	sortLinked(p)
+end
+
+local function isEar(ear: Node): boolean
+	local a, b, c = ear.prev, ear, ear.next
+	if area(a, b, c) >= 0 then
+		return false -- reflex
+	end
+	local ax, bx, cx, ay, by, cy = a.x, b.x, c.x, a.y, b.y, c.y
+	local x0, y0 = math.min(ax, bx, cx), math.min(ay, by, cy)
+	local x1, y1 = math.max(ax, bx, cx), math.max(ay, by, cy)
+	local p = c.next
+	while p ~= a do
+		if p.x >= x0 and p.x <= x1 and p.y >= y0 and p.y <= y1
+			and pointInTriangle(ax, ay, bx, by, cx, cy, p.x, p.y)
+			and area(p.prev, p, p.next) >= 0
+		then
+			return false
+		end
+		p = p.next
+	end
+	return true
+end
+
+local function isEarHashed(ear: Node, minX: number, minY: number, invSize: number): boolean
+	local a, b, c = ear.prev, ear, ear.next
+	if area(a, b, c) >= 0 then
+		return false
+	end
+	local ax, bx, cx, ay, by, cy = a.x, b.x, c.x, a.y, b.y, c.y
+	local x0, y0 = math.min(ax, bx, cx), math.min(ay, by, cy)
+	local x1, y1 = math.max(ax, bx, cx), math.max(ay, by, cy)
+	local minZ = zOrder(x0, y0, minX, minY, invSize)
+	local maxZ = zOrder(x1, y1, minX, minY, invSize)
+
+	local function blocks(p: Node): boolean
+		return p.x >= x0 and p.x <= x1 and p.y >= y0 and p.y <= y1 and p ~= a and p ~= c
+			and pointInTriangle(ax, ay, bx, by, cx, cy, p.x, p.y)
+			and area(p.prev, p, p.next) >= 0
+	end
+
+	local p, n = ear.prevZ, ear.nextZ
+	while p and p.z >= minZ and n and n.z <= maxZ do
+		if blocks(p) then
+			return false
+		end
+		p = p.prevZ
+		if blocks(n) then
+			return false
+		end
+		n = n.nextZ
+	end
+	while p and p.z >= minZ do
+		if blocks(p) then
+			return false
+		end
+		p = p.prevZ
+	end
+	while n and n.z <= maxZ do
+		if blocks(n) then
+			return false
+		end
+		n = n.nextZ
+	end
+	return true
+end
+
+local earcutLinked: (Node?, { number }, number, number, number, number) -> ()
+
+local function cureLocalIntersections(start: Node, triangles: { number }): Node?
+	local p = start
+	repeat
+		local a, b = p.prev, p.next.next
+		if not equals(a, b) and intersects(a, p, p.next, b) and locallyInside(a, b) and locallyInside(b, a) then
+			table.insert(triangles, a.i)
+			table.insert(triangles, p.i)
+			table.insert(triangles, b.i)
+			removeNode(p)
+			removeNode(p.next)
+			p = b
+			start = b
+		end
+		p = p.next
+	until p == start
+	return filterPoints(p)
+end
+
+local function splitEarcut(start: Node, triangles: { number }, minX: number, minY: number, invSize: number)
+	local a = start
+	repeat
+		local b = a.next.next
+		while b ~= a.prev do
+			if a.i ~= b.i and isValidDiagonal(a, b) then
+				local c = splitPolygon(a, b)
+				local fa = filterPoints(a, a.next)
+				local fc = filterPoints(c, c.next)
+				earcutLinked(fa, triangles, minX, minY, invSize, 0)
+				earcutLinked(fc, triangles, minX, minY, invSize, 0)
+				return
+			end
+			b = b.next
+		end
+		a = a.next
+	until a == start
+end
+
+earcutLinked = function(ear: Node?, triangles: { number }, minX: number, minY: number, invSize: number, pass: number)
+	if not ear then
+		return
+	end
+	local node = ear :: Node
+	if pass == 0 and invSize ~= 0 then
+		indexCurve(node, minX, minY, invSize)
+	end
+	local stop = node
+	while node.prev ~= node.next do
+		local prev, nxt = node.prev, node.next
+		local ok = if invSize ~= 0 then isEarHashed(node, minX, minY, invSize) else isEar(node)
+		if ok then
+			table.insert(triangles, prev.i)
+			table.insert(triangles, node.i)
+			table.insert(triangles, nxt.i)
+			removeNode(node)
+			node = nxt.next
+			stop = nxt.next
+			continue
+		end
+		node = nxt
+		if node == stop then
+			if pass == 0 then
+				earcutLinked(filterPoints(node), triangles, minX, minY, invSize, 1)
+			elseif pass == 1 then
+				local filtered = filterPoints(node)
+				if filtered then
+					earcutLinked(cureLocalIntersections(filtered, triangles), triangles, minX, minY, invSize, 2)
+				end
+			else
+				splitEarcut(node, triangles, minX, minY, invSize)
+			end
+			break
+		end
+	end
+end
+
+local function getLeftmost(start: Node): Node
+	local p, leftmost = start, start
+	repeat
+		if p.x < leftmost.x or (p.x == leftmost.x and p.y < leftmost.y) then
+			leftmost = p
+		end
+		p = p.next
+	until p == start
+	return leftmost
+end
+
+local function sectorContainsSector(m: Node, p: Node): boolean
+	return area(m.prev, m, p.prev) < 0 and area(p.next, m, m.next) < 0
+end
+
+-- David Eberly's algorithm for finding a bridge between a hole and the outer polygon.
+local function findHoleBridge(hole: Node, outerNode: Node): Node?
+	local p = outerNode
+	local hx, hy = hole.x, hole.y
+	local qx = -math.huge
+	local m: Node? = nil
+	repeat
+		if hy <= p.y and hy >= p.next.y and p.next.y ~= p.y then
+			local x = p.x + (hy - p.y) * (p.next.x - p.x) / (p.next.y - p.y)
+			if x <= hx and x > qx then
+				qx = x
+				m = if p.x < p.next.x then p else p.next
+				if x == hx then
+					return m
+				end
+			end
+		end
+		p = p.next
+	until p == outerNode
+	if not m then
+		return nil
+	end
+
+	local best = m :: Node
+	local stop = best
+	local mx, my = best.x, best.y
+	local tanMin = math.huge
+	p = best
+	repeat
+		if hx >= p.x and p.x >= mx and hx ~= p.x
+			and pointInTriangle(if hy < my then hx else qx, hy, mx, my, if hy < my then qx else hx, hy, p.x, p.y)
+		then
+			local tan = math.abs(hy - p.y) / (hx - p.x)
+			if locallyInside(p, hole)
+				and (tan < tanMin or (tan == tanMin and (p.x > best.x or (p.x == best.x and sectorContainsSector(best, p)))))
+			then
+				best = p
+				tanMin = tan
+			end
+		end
+		p = p.next
+	until p == stop
+	return best
+end
+
+local function eliminateHole(hole: Node, outerNode: Node): Node
+	local bridge = findHoleBridge(hole, outerNode)
+	if not bridge then
+		return outerNode
+	end
+	local bridgeReverse = splitPolygon(bridge, hole)
+	filterPoints(bridgeReverse, bridgeReverse.next)
+	return filterPoints(bridge, bridge.next) :: Node
+end
+
+local function eliminateHoles(xs: { number }, ys: { number }, holeStarts: { number }, outerNode: Node): Node
+	local queue = {}
+	for k, s in holeStarts do
+		local e = if k < #holeStarts then holeStarts[k + 1] - 1 else #xs
+		local list = linkedList(xs, ys, s, e, false)
+		if list then
+			if list == list.next then
+				list.steiner = true
+			end
+			table.insert(queue, getLeftmost(list))
+		end
+	end
+	table.sort(queue, function(a, b)
+		return a.x < b.x
+	end)
+	for _, hole in queue do
+		outerNode = eliminateHole(hole, outerNode)
+	end
+	return outerNode
+end
+
+-- xs/ys: the outer ring followed by each hole ring. holeStarts: index where each hole begins.
+-- Returns a flat list of vertex indices, three per triangle.
+function Earcut.triangulate(xs: { number }, ys: { number }, holeStarts: { number }?): { number }
+	local n = #xs
+	local hasHoles = holeStarts ~= nil and #holeStarts > 0
+	local outerEnd = if hasHoles then (holeStarts :: { number })[1] - 1 else n
+	local triangles = {}
+	local outerNode = linkedList(xs, ys, 1, outerEnd, true)
+	if not outerNode or outerNode.next == outerNode.prev then
+		return triangles
+	end
+	if hasHoles then
+		outerNode = eliminateHoles(xs, ys, holeStarts :: { number }, outerNode)
+	end
+
+	local minX, minY, invSize = 0, 0, 0
+	if n > 80 then
+		minX, minY = xs[1], ys[1]
+		local maxX, maxY = minX, minY
+		for i = 2, outerEnd do
+			local x, y = xs[i], ys[i]
+			if x < minX then minX = x end
+			if y < minY then minY = y end
+			if x > maxX then maxX = x end
+			if y > maxY then maxY = y end
+		end
+		invSize = math.max(maxX - minX, maxY - minY)
+		invSize = if invSize ~= 0 then 32767 / invSize else 0
+	end
+
+	earcutLinked(outerNode, triangles, minX, minY, invSize, 0)
+	return triangles
+end
+
+return Earcut
+]]></string>
+      </Properties>
+    </Item>
+    <Item class="ModuleScript" referent="2">
+      <Properties>
+        <string name="Name">MeshBuilder</string>
+        <string name="Source"><![CDATA[-- Turns parsed SVG shapes into extruded triangle meshes (plain tables, no Roblox types),
+-- grouped by fill color and split to stay under Roblox's per-mesh limits.
+--
+-- Model space: the SVG is centered on the origin, readable from the -Z side (the part's Front),
+-- with SVG +x going toward the viewer's right and SVG +y going down.
+
+local Earcut = if script then require(script.Parent.Earcut) else require("./Earcut")
+local Regions = if script then require(script.Parent.Regions) else require("./Regions")
+
+local MeshBuilder = {}
+
+export type MeshData = {
+	name: string,
+	color: { number },
+	transparency: number,
+	positions: { { number } },
+	tris: { { number } },
+	center: { number },
+	size: { number },
+}
+
+export type Options = {
+	width: number, -- studs across the widest SVG dimension
+	thickness: number, -- extrusion depth in studs; 0 gives a flat double-sided plate
+	layerGap: number, -- extra depth per stacked layer, so overlapping shapes don't z-fight
+	smoothAngle: number?, -- side walls stay smooth across corners sharper than this (degrees)
+	maxTriangles: number?,
+	maxVertices: number?,
+}
+
+export type Result = {
+	meshes: { MeshData },
+	warnings: { string },
+	triangles: number,
+	vertices: number,
+	width: number,
+	height: number,
+}
+
+local function reversed(ring: Regions.Ring): Regions.Ring
+	local out = table.create(#ring)
+	for k = #ring, 1, -1 do
+		table.insert(out, ring[k])
+	end
+	return out
+end
+
+local function cleanRing(points: Regions.Ring, eps: number): Regions.Ring
+	local out = {}
+	for _, p in points do
+		local last = out[#out]
+		if not last or math.abs(last[1] - p[1]) > eps or math.abs(last[2] - p[2]) > eps then
+			table.insert(out, p)
+		end
+	end
+	while #out > 1 and math.abs(out[1][1] - out[#out][1]) <= eps and math.abs(out[1][2] - out[#out][2]) <= eps do
+		table.remove(out)
+	end
+	return out
+end
+
+local function ringBounds(ring: Regions.Ring, box: { number })
+	for _, p in ring do
+		box[1] = math.min(box[1], p[1])
+		box[2] = math.min(box[2], p[2])
+		box[3] = math.max(box[3], p[1])
+		box[4] = math.max(box[4], p[2])
+	end
+end
+
+type Fragment = { positions: { { number } }, tris: { { number } } }
+
+local function buildFragment(polygon: Regions.Polygon, zFront: number, zBack: number, smoothCos: number): Fragment
+	local positions, tris = {}, {}
+
+	local function vertex(x: number, y: number, z: number): number
+		table.insert(positions, { x, y, z })
+		return #positions
+	end
+
+	-- Adds a triangle wound so its face normal agrees with (nx, ny, nz).
+	local function triangle(a: number, b: number, c: number, nx: number, ny: number, nz: number)
+		local pa, pb, pc = positions[a], positions[b], positions[c]
+		local ux, uy, uz = pb[1] - pa[1], pb[2] - pa[2], pb[3] - pa[3]
+		local wx, wy, wz = pc[1] - pa[1], pc[2] - pa[2], pc[3] - pa[3]
+		local cx = uy * wz - uz * wy
+		local cy = uz * wx - ux * wz
+		local cz = ux * wy - uy * wx
+		if cx * nx + cy * ny + cz * nz < 0 then
+			b, c = c, b
+		end
+		table.insert(tris, { a, b, c })
+	end
+
+	-- Outer outline counter-clockwise, holes clockwise: material is always on the left.
+	local outer = if Regions.signedArea(polygon.outer) > 0 then polygon.outer else reversed(polygon.outer)
+	local rings = { outer }
+	for _, hole in polygon.holes do
+		table.insert(rings, if Regions.signedArea(hole) < 0 then hole else reversed(hole))
+	end
+
+	-- Front and back caps.
+	local xs, ys, holeStarts = {}, {}, {}
+	for k, ring in rings do
+		if k > 1 then
+			table.insert(holeStarts, #xs + 1)
+		end
+		for _, p in ring do
+			table.insert(xs, p[1])
+			table.insert(ys, p[2])
+		end
+	end
+	local capTris = Earcut.triangulate(xs, ys, holeStarts)
+	if #capTris == 0 then
+		return { positions = positions, tris = tris }
+	end
+	local front, back = {}, {}
+	for k = 1, #xs do
+		front[k] = vertex(xs[k], ys[k], zFront)
+		back[k] = vertex(xs[k], ys[k], zBack)
+	end
+	for t = 1, #capTris, 3 do
+		local a, b, c = capTris[t], capTris[t + 1], capTris[t + 2]
+		triangle(front[a], front[b], front[c], 0, 0, -1)
+		triangle(back[a], back[b], back[c], 0, 0, 1)
+	end
+
+	if zBack - zFront <= 1e-6 then
+		return { positions = positions, tris = tris }
+	end
+
+	-- Side walls. Corners gentler than smoothAngle share vertices so curves shade smoothly;
+	-- sharper corners get their own vertices for a crisp edge.
+	for _, ring in rings do
+		local n = #ring
+		local startF, startB, endF, endB = {}, {}, {}, {}
+		for k = 1, n do
+			local p0, p1, p2 = ring[(k - 2) % n + 1], ring[k], ring[k % n + 1]
+			local ax, ay = p1[1] - p0[1], p1[2] - p0[2]
+			local bx, by = p2[1] - p1[1], p2[2] - p1[2]
+			local la, lb = math.sqrt(ax * ax + ay * ay), math.sqrt(bx * bx + by * by)
+			local smooth = la > 0 and lb > 0 and (ax * bx + ay * by) / (la * lb) >= smoothCos
+			local x, y = p1[1], p1[2]
+			startF[k], startB[k] = vertex(x, y, zFront), vertex(x, y, zBack)
+			if smooth then
+				endF[k], endB[k] = startF[k], startB[k]
+			else
+				endF[k], endB[k] = vertex(x, y, zFront), vertex(x, y, zBack)
+			end
+		end
+		for k = 1, n do
+			local k2 = k % n + 1
+			local p, q = ring[k], ring[k2]
+			local nx, ny = q[2] - p[2], -(q[1] - p[1]) -- right of the edge = outside the material
+			triangle(startF[k], endF[k2], endB[k2], nx, ny, 0)
+			triangle(startF[k], endB[k2], startB[k], nx, ny, 0)
+		end
+	end
+
+	return { positions = positions, tris = tris }
+end
+
+function MeshBuilder.build(shapes: { any }, options: Options): Result
+	local maxTris = options.maxTriangles or 20000
+	local maxVerts = options.maxVertices or 60000
+	local smoothCos = math.cos(math.rad(options.smoothAngle or 30))
+	local thickness = math.max(0, options.thickness)
+	local gap = math.max(0, options.layerGap)
+	local warnings = {}
+
+	local minX, minY, maxX, maxY = math.huge, math.huge, -math.huge, -math.huge
+	for _, shape in shapes do
+		for _, ring in shape.rings do
+			for _, p in ring do
+				minX, maxX = math.min(minX, p[1]), math.max(maxX, p[1])
+				minY, maxY = math.min(minY, p[2]), math.max(maxY, p[2])
+			end
+		end
+	end
+	if minX > maxX then
+		error("No filled shapes were found in this SVG.", 0)
+	end
+	local extent = if maxX > minX then maxX - minX else maxY - minY
+	if extent <= 0 then
+		error("The SVG's shapes have no area.", 0)
+	end
+	local scale = options.width / extent
+	local midX, midY = (minX + maxX) / 2, (minY + maxY) / 2
+	local eps = 1e-6 * options.width
+
+	-- Convert to model space and resolve fill rules.
+	local prepared = {}
+	for _, shape in shapes do
+		local rings = {}
+		for _, ring in shape.rings do
+			local converted = table.create(#ring)
+			for k, p in ring do
+				converted[k] = { -(p[1] - midX) * scale, -(p[2] - midY) * scale }
+			end
+			converted = cleanRing(converted, eps)
+			if #converted >= 3 and math.abs(Regions.signedArea(converted)) > eps * eps then
+				table.insert(rings, converted)
+			end
+		end
+		if #rings > 0 then
+			local polygons = Regions.resolve(rings, shape.fillRule)
+			if #polygons > 0 then
+				local box = { math.huge, math.huge, -math.huge, -math.huge }
+				for _, polygon in polygons do
+					ringBounds(polygon.outer, box)
+				end
+				table.insert(prepared, { shape = shape, polygons = polygons, box = box, layer = 0 })
+			end
+		end
+	end
+
+	-- Shapes drawn on top of earlier overlapping shapes sit one layer further out.
+	for i, a in prepared do
+		for j = 1, i - 1 do
+			local b = prepared[j]
+			if a.box[1] < b.box[3] and b.box[1] < a.box[3] and a.box[2] < b.box[4] and b.box[2] < a.box[4] then
+				a.layer = math.max(a.layer, b.layer + 1)
+			end
+		end
+	end
+
+	local groups, groupOrder = {}, {}
+	local skipped = 0
+	for _, item in prepared do
+		local shape = item.shape
+		local r, g, b = shape.color[1], shape.color[2], shape.color[3]
+		local hex = string.format("%02X%02X%02X", math.round(r * 255), math.round(g * 255), math.round(b * 255))
+		local key = hex .. "_" .. math.round(shape.alpha * 100)
+		local group = groups[key]
+		if not group then
+			group = { hex = hex, color = { r, g, b }, transparency = 1 - shape.alpha, chunks = {} }
+			groups[key] = group
+			table.insert(groupOrder, group)
+		end
+
+		local zFront = -(thickness / 2 + item.layer * gap)
+		local zBack = thickness / 2 + item.layer * gap
+		for _, polygon in item.polygons do
+			local fragment = buildFragment(polygon, zFront, zBack, smoothCos)
+			if #fragment.tris == 0 then
+				continue
+			end
+			if #fragment.tris > maxTris or #fragment.positions > maxVerts then
+				skipped += 1
+				continue
+			end
+			local chunk = group.chunks[#group.chunks]
+			if not chunk or #chunk.tris + #fragment.tris > maxTris or #chunk.positions + #fragment.positions > maxVerts then
+				chunk = { positions = {}, tris = {} }
+				table.insert(group.chunks, chunk)
+			end
+			local base = #chunk.positions
+			for _, p in fragment.positions do
+				table.insert(chunk.positions, p)
+			end
+			for _, t in fragment.tris do
+				table.insert(chunk.tris, { t[1] + base, t[2] + base, t[3] + base })
+			end
+		end
+	end
+	if skipped > 0 then
+		table.insert(warnings, ("%d shape(s) needed more than %d triangles on their own and were skipped. Lower Curve quality or simplify them."):format(skipped, maxTris))
+	end
+
+	-- Center each chunk on its own bounding box; the part gets placed at that center.
+	local meshes: { MeshData } = {}
+	local totalTris, totalVerts = 0, 0
+	for _, group in groupOrder do
+		for index, chunk in group.chunks do
+			local lo = { math.huge, math.huge, math.huge }
+			local hi = { -math.huge, -math.huge, -math.huge }
+			for _, p in chunk.positions do
+				for axis = 1, 3 do
+					lo[axis] = math.min(lo[axis], p[axis])
+					hi[axis] = math.max(hi[axis], p[axis])
+				end
+			end
+			local center = { (lo[1] + hi[1]) / 2, (lo[2] + hi[2]) / 2, (lo[3] + hi[3]) / 2 }
+			local positions = table.create(#chunk.positions)
+			for k, p in chunk.positions do
+				positions[k] = { p[1] - center[1], p[2] - center[2], p[3] - center[3] }
+			end
+			table.insert(meshes, {
+				name = "Fill_" .. group.hex .. (if #group.chunks > 1 then "_" .. index else ""),
+				color = group.color,
+				transparency = group.transparency,
+				positions = positions,
+				tris = chunk.tris,
+				center = center,
+				size = { hi[1] - lo[1], hi[2] - lo[2], hi[3] - lo[3] },
+			})
+			totalTris += #chunk.tris
+			totalVerts += #chunk.positions
+		end
+	end
+	if #meshes == 0 then
+		error("No filled shapes were found in this SVG.", 0)
+	end
+
+	return {
+		meshes = meshes,
+		warnings = warnings,
+		triangles = totalTris,
+		vertices = totalVerts,
+		width = (maxX - minX) * scale,
+		height = (maxY - minY) * scale,
+	}
+end
+
+return MeshBuilder
+]]></string>
+      </Properties>
+    </Item>
+    <Item class="ModuleScript" referent="3">
+      <Properties>
+        <string name="Name">MeshEmitter</string>
+        <string name="Source"><![CDATA[-- Roblox side: MeshData -> EditableMesh -> MeshPart, and uploading EditableMeshes as Mesh assets.
+
+local AssetService = game:GetService("AssetService")
+
+local MeshEmitter = {}
+
+local YIELD_EVERY = 4000
+
+function MeshEmitter.createEditableMesh(data): EditableMesh
+	local mesh = AssetService:CreateEditableMesh()
+	if not mesh then
+		error("Roblox ran out of EditableMesh memory.", 0)
+	end
+	local ids = table.create(#data.positions)
+	for i, p in data.positions do
+		ids[i] = mesh:AddVertex(Vector3.new(p[1], p[2], p[3]))
+		if i % YIELD_EVERY == 0 then
+			task.wait()
+		end
+	end
+	for i, t in data.tris do
+		mesh:AddTriangle(ids[t[1]], ids[t[2]], ids[t[3]])
+		if i % YIELD_EVERY == 0 then
+			task.wait()
+		end
+	end
+	return mesh
+end
+
+function MeshEmitter.createPart(data, mesh: EditableMesh, collision: Enum.CollisionFidelity): MeshPart
+	local part = AssetService:CreateMeshPartAsync(Content.fromObject(mesh), { CollisionFidelity = collision })
+	part.Name = data.name
+	part.Color = Color3.new(data.color[1], data.color[2], data.color[3])
+	part.Transparency = data.transparency
+	part.Material = Enum.Material.SmoothPlastic
+	part.Anchored = true
+	return part
+end
+
+-- Uploads to the Studio user's account (or a group). Returns the new asset id, or nil and an error.
+function MeshEmitter.upload(mesh: EditableMesh, name: string, groupId: number?): (number?, string?)
+	local params: { [string]: any } = {
+		Name = name,
+		Description = "Imported from SVG with SVG Mesh Importer",
+	}
+	if groupId then
+		params.CreatorType = Enum.AssetCreatorType.Group
+		params.CreatorId = groupId
+	end
+	local ok, result, idOrError = pcall(function()
+		return AssetService:CreateAssetAsync(mesh, Enum.AssetType.Mesh, params)
+	end)
+	if not ok then
+		return nil, tostring(result)
+	end
+	if result ~= Enum.CreateAssetResult.Success then
+		return nil, tostring(result) .. (if idOrError then ": " .. tostring(idOrError) else "")
+	end
+	return tonumber(idOrError), nil
+end
+
+-- Points an existing part at an uploaded mesh asset. New uploads can take a moment to become
+-- loadable, so retry with backoff.
+function MeshEmitter.applyAsset(part: MeshPart, assetId: number, collision: Enum.CollisionFidelity): (boolean, string?)
+	local lastError
+	for attempt = 1, 8 do
+		local ok, result = pcall(function()
+			return AssetService:CreateMeshPartAsync(Content.fromAssetId(assetId), { CollisionFidelity = collision })
+		end)
+		if ok then
+			part:ApplyMesh(result)
+			result:Destroy()
+			return true, nil
+		end
+		lastError = tostring(result)
+		task.wait(math.min(2 * attempt, 8))
+	end
+	return false, lastError
+end
+
+return MeshEmitter
+]]></string>
+      </Properties>
+    </Item>
+    <Item class="ModuleScript" referent="4">
+      <Properties>
+        <string name="Name">PathData</string>
+        <string name="Source"><![CDATA[-- Parses SVG path data ("d" attribute) and flattens curves and arcs into point lists.
+-- Every subpath is returned as a closed polygon outline, since the importer only fills shapes.
+
+local PathData = {}
+
+export type Point = { number }
+export type Subpath = { Point }
+
+local COMMANDS = "[MmLlHhVvCcSsQqTtAaZz]"
+
+-- tol: maximum distance (in the path's own units) between a curve and its flattened outline.
+function PathData.parse(d: string, tol: number): ({ Subpath }, string?)
+	local subpaths: { Subpath } = {}
+	local current: Subpath? = nil
+	local i, n = 1, #d
+	local cx, cy = 0, 0 -- current point
+	local sx, sy = 0, 0 -- start of the current subpath
+	local ctrlX, ctrlY = 0, 0 -- last control point, for S and T
+	local prevCmd = ""
+
+	local function skipSeparators()
+		while i <= n do
+			local b = string.byte(d, i)
+			if b == 32 or b == 9 or b == 10 or b == 13 or b == 44 then
+				i += 1
+			else
+				break
+			end
+		end
+	end
+
+	local function hasNumber(): boolean
+		skipSeparators()
+		return i <= n and d:sub(i, i):match("[%d%.%+%-]") ~= nil
+	end
+
+	local function readNumber(): number
+		skipSeparators()
+		local s, e = d:find("^[%+%-]?%d*%.?%d+[eE][%+%-]?%d+", i)
+		if not s then
+			s, e = d:find("^[%+%-]?%d*%.?%d+", i)
+		end
+		if not s then
+			error(("bad number in path data near %q"):format(d:sub(i, i + 12)), 0)
+		end
+		i = e + 1
+		return tonumber(d:sub(s, e)) :: number
+	end
+
+	-- Arc flags may be packed without separators ("a1 1 0 00 1 1"), so read one character.
+	local function readFlag(): boolean
+		skipSeparators()
+		local c = d:sub(i, i)
+		if c == "0" or c == "1" then
+			i += 1
+			return c == "1"
+		end
+		error("bad arc flag in path data", 0)
+	end
+
+	local function startSubpath(x: number, y: number)
+		current = { { x, y } }
+		table.insert(subpaths, current :: Subpath)
+		sx, sy = x, y
+	end
+
+	local function lineTo(x: number, y: number)
+		if not current then
+			startSubpath(cx, cy)
+		end
+		table.insert(current :: Subpath, { x, y })
+	end
+
+	local function cubic(x1: number, y1: number, x2: number, y2: number, x: number, y: number)
+		local ddx = math.max(math.abs(cx - 2 * x1 + x2), math.abs(x1 - 2 * x2 + x))
+		local ddy = math.max(math.abs(cy - 2 * y1 + y2), math.abs(y1 - 2 * y2 + y))
+		local dd = math.sqrt(ddx * ddx + ddy * ddy)
+		local segments = math.clamp(math.ceil(math.sqrt(6 * dd / (8 * tol))), 1, 256)
+		local x0, y0 = cx, cy
+		for s = 1, segments do
+			local t = s / segments
+			local mt = 1 - t
+			local a, b, c, e = mt * mt * mt, 3 * mt * mt * t, 3 * mt * t * t, t * t * t
+			lineTo(a * x0 + b * x1 + c * x2 + e * x, a * y0 + b * y1 + c * y2 + e * y)
+		end
+	end
+
+	local function quadratic(x1: number, y1: number, x: number, y: number)
+		local ddx, ddy = cx - 2 * x1 + x, cy - 2 * y1 + y
+		local dd = math.sqrt(ddx * ddx + ddy * ddy)
+		local segments = math.clamp(math.ceil(math.sqrt(2 * dd / (8 * tol))), 1, 256)
+		local x0, y0 = cx, cy
+		for s = 1, segments do
+			local t = s / segments
+			local mt = 1 - t
+			lineTo(mt * mt * x0 + 2 * mt * t * x1 + t * t * x, mt * mt * y0 + 2 * mt * t * y1 + t * t * y)
+		end
+	end
+
+	-- Endpoint-to-center conversion from the SVG spec (implementation notes F.6.5).
+	local function arc(rx: number, ry: number, phiDeg: number, largeArc: boolean, sweep: boolean, x: number, y: number)
+		local x0, y0 = cx, cy
+		if x0 == x and y0 == y then
+			return
+		end
+		rx, ry = math.abs(rx), math.abs(ry)
+		if rx == 0 or ry == 0 then
+			lineTo(x, y)
+			return
+		end
+		local phi = math.rad(phiDeg % 360)
+		local cosP, sinP = math.cos(phi), math.sin(phi)
+		local hx, hy = (x0 - x) / 2, (y0 - y) / 2
+		local x1p = cosP * hx + sinP * hy
+		local y1p = -sinP * hx + cosP * hy
+		local lambda = (x1p * x1p) / (rx * rx) + (y1p * y1p) / (ry * ry)
+		if lambda > 1 then
+			local s = math.sqrt(lambda)
+			rx *= s
+			ry *= s
+		end
+		local num = rx * rx * ry * ry - rx * rx * y1p * y1p - ry * ry * x1p * x1p
+		local den = rx * rx * y1p * y1p + ry * ry * x1p * x1p
+		local coef = if den > 0 then math.sqrt(math.max(0, num / den)) else 0
+		if largeArc == sweep then
+			coef = -coef
+		end
+		local cxp = coef * (rx * y1p / ry)
+		local cyp = coef * (-ry * x1p / rx)
+		local centerX = cosP * cxp - sinP * cyp + (x0 + x) / 2
+		local centerY = sinP * cxp + cosP * cyp + (y0 + y) / 2
+
+		local ux, uy = (x1p - cxp) / rx, (y1p - cyp) / ry
+		local vx, vy = (-x1p - cxp) / rx, (-y1p - cyp) / ry
+		local theta1 = math.atan2(uy, ux)
+		local dTheta = math.atan2(ux * vy - uy * vx, ux * vx + uy * vy)
+		if not sweep and dTheta > 0 then
+			dTheta -= 2 * math.pi
+		elseif sweep and dTheta < 0 then
+			dTheta += 2 * math.pi
+		end
+
+		local r = math.max(rx, ry)
+		local step = if tol < r then 2 * math.acos(1 - tol / r) else math.pi / 2
+		local segments = math.clamp(math.ceil(math.abs(dTheta) / step), 1, 256)
+		for s = 1, segments - 1 do
+			local t = theta1 + dTheta * s / segments
+			local ex, ey = rx * math.cos(t), ry * math.sin(t)
+			lineTo(cosP * ex - sinP * ey + centerX, sinP * ex + cosP * ey + centerY)
+		end
+		lineTo(x, y)
+	end
+
+	local ok, err = pcall(function()
+		local cmd: string? = nil
+		while true do
+			skipSeparators()
+			if i > n then
+				break
+			end
+			local c = d:sub(i, i)
+			if c:match(COMMANDS) then
+				cmd = c
+				i += 1
+			elseif not cmd or not hasNumber() then
+				-- Garbage or numbers after Z: stop, keeping what was parsed (as browsers do).
+				break
+			end
+
+			local command = cmd :: string
+			local rel = command:lower() == command
+			local C = command:upper()
+
+			if C == "Z" then
+				cx, cy = sx, sy
+				current = nil
+				cmd = nil
+			elseif C == "M" then
+				local x, y = readNumber(), readNumber()
+				if rel then
+					x += cx
+					y += cy
+				end
+				startSubpath(x, y)
+				cx, cy = x, y
+				-- Extra coordinate pairs after a moveto are implicit linetos.
+				cmd = if rel then "l" else "L"
+			elseif C == "L" then
+				local x, y = readNumber(), readNumber()
+				if rel then
+					x += cx
+					y += cy
+				end
+				lineTo(x, y)
+				cx, cy = x, y
+			elseif C == "H" then
+				local x = readNumber()
+				if rel then
+					x += cx
+				end
+				lineTo(x, cy)
+				cx = x
+			elseif C == "V" then
+				local y = readNumber()
+				if rel then
+					y += cy
+				end
+				lineTo(cx, y)
+				cy = y
+			elseif C == "C" then
+				local x1, y1, x2, y2, x, y =
+					readNumber(), readNumber(), readNumber(), readNumber(), readNumber(), readNumber()
+				if rel then
+					x1, y1, x2, y2, x, y = x1 + cx, y1 + cy, x2 + cx, y2 + cy, x + cx, y + cy
+				end
+				cubic(x1, y1, x2, y2, x, y)
+				ctrlX, ctrlY = x2, y2
+				cx, cy = x, y
+			elseif C == "S" then
+				local x2, y2, x, y = readNumber(), readNumber(), readNumber(), readNumber()
+				if rel then
+					x2, y2, x, y = x2 + cx, y2 + cy, x + cx, y + cy
+				end
+				local x1, y1 = cx, cy
+				if prevCmd == "C" or prevCmd == "S" then
+					x1, y1 = 2 * cx - ctrlX, 2 * cy - ctrlY
+				end
+				cubic(x1, y1, x2, y2, x, y)
+				ctrlX, ctrlY = x2, y2
+				cx, cy = x, y
+			elseif C == "Q" then
+				local x1, y1, x, y = readNumber(), readNumber(), readNumber(), readNumber()
+				if rel then
+					x1, y1, x, y = x1 + cx, y1 + cy, x + cx, y + cy
+				end
+				quadratic(x1, y1, x, y)
+				ctrlX, ctrlY = x1, y1
+				cx, cy = x, y
+			elseif C == "T" then
+				local x, y = readNumber(), readNumber()
+				if rel then
+					x += cx
+					y += cy
+				end
+				local x1, y1 = cx, cy
+				if prevCmd == "Q" or prevCmd == "T" then
+					x1, y1 = 2 * cx - ctrlX, 2 * cy - ctrlY
+				end
+				quadratic(x1, y1, x, y)
+				ctrlX, ctrlY = x1, y1
+				cx, cy = x, y
+			elseif C == "A" then
+				local rx, ry, rot = readNumber(), readNumber(), readNumber()
+				local largeArc, sweep = readFlag(), readFlag()
+				local x, y = readNumber(), readNumber()
+				if rel then
+					x += cx
+					y += cy
+				end
+				arc(rx, ry, rot, largeArc, sweep, x, y)
+				cx, cy = x, y
+			end
+			prevCmd = C
+		end
+	end)
+
+	local result = {}
+	for _, sub in subpaths do
+		if #sub >= 3 then
+			table.insert(result, sub)
+		end
+	end
+	return result, if ok then nil else tostring(err)
+end
+
+return PathData
+]]></string>
+      </Properties>
+    </Item>
+    <Item class="ModuleScript" referent="5">
+      <Properties>
+        <string name="Name">Regions</string>
+        <string name="Source"><![CDATA[-- Applies an SVG fill rule to a shape's outlines, producing polygons with holes.
+-- Assumes outlines do not cross each other (true for nearly all exported artwork).
+
+local Regions = {}
+
+export type Ring = { { number } }
+export type Polygon = { outer: Ring, holes: { Ring } }
+
+function Regions.signedArea(ring: Ring): number
+	local sum = 0
+	local n = #ring
+	for k = 1, n do
+		local p, q = ring[k], ring[k % n + 1]
+		sum += p[1] * q[2] - q[1] * p[2]
+	end
+	return sum / 2
+end
+
+local function pointInRing(x: number, y: number, ring: Ring): boolean
+	local inside = false
+	local n = #ring
+	local j = n
+	for k = 1, n do
+		local xi, yi = ring[k][1], ring[k][2]
+		local xj, yj = ring[j][1], ring[j][2]
+		if ((yi > y) ~= (yj > y)) and (x < (xj - xi) * (y - yi) / (yj - yi) + xi) then
+			inside = not inside
+		end
+		j = k
+	end
+	return inside
+end
+
+-- Majority vote over a few sample vertices, so a vertex that touches the other ring can't flip the answer.
+local function ringInside(inner: Ring, outer: Ring): boolean
+	local n = #inner
+	local stride = math.max(1, n // 5)
+	local votes, total = 0, 0
+	for k = 1, n, stride do
+		total += 1
+		if pointInRing(inner[k][1], inner[k][2], outer) then
+			votes += 1
+		end
+		if total >= 5 then
+			break
+		end
+	end
+	return votes * 2 > total
+end
+
+local function bounds(ring: Ring): { number }
+	local minX, minY, maxX, maxY = math.huge, math.huge, -math.huge, -math.huge
+	for _, p in ring do
+		minX, maxX = math.min(minX, p[1]), math.max(maxX, p[1])
+		minY, maxY = math.min(minY, p[2]), math.max(maxY, p[2])
+	end
+	return { minX, minY, maxX, maxY }
+end
+
+function Regions.resolve(rings: { Ring }, fillRule: string): { Polygon }
+	local info = {}
+	for k, ring in rings do
+		info[k] = { ring = ring, area = Regions.signedArea(ring), box = bounds(ring), containers = {} }
+	end
+
+	for k, a in info do
+		for j, b in info do
+			if j ~= k
+				and math.abs(b.area) > math.abs(a.area)
+				and a.box[1] >= b.box[1] and a.box[2] >= b.box[2] and a.box[3] <= b.box[3] and a.box[4] <= b.box[4]
+				and ringInside(a.ring, b.ring)
+			then
+				table.insert(a.containers, j)
+			end
+		end
+	end
+
+	local outers, holes = {}, {}
+	for k, a in info do
+		local filledOutside, filledInside
+		if fillRule == "evenodd" then
+			local depth = #a.containers
+			filledOutside = depth % 2 == 1
+			filledInside = (depth + 1) % 2 == 1
+		else
+			local winding = 0
+			for _, j in a.containers do
+				winding += if info[j].area > 0 then 1 else -1
+			end
+			filledOutside = winding ~= 0
+			filledInside = winding + (if a.area > 0 then 1 else -1) ~= 0
+		end
+		if filledInside and not filledOutside then
+			table.insert(outers, k)
+		elseif filledOutside and not filledInside then
+			table.insert(holes, k)
+		end
+	end
+
+	local polygons: { Polygon } = {}
+	local byOuter = {}
+	for _, k in outers do
+		local polygon = { outer = info[k].ring, holes = {} }
+		byOuter[k] = polygon
+		table.insert(polygons, polygon)
+	end
+	for _, h in holes do
+		-- A hole belongs to the smallest filled outline around it.
+		local best, bestArea = nil, math.huge
+		for _, j in info[h].containers do
+			if byOuter[j] and math.abs(info[j].area) < bestArea then
+				best, bestArea = j, math.abs(info[j].area)
+			end
+		end
+		if best then
+			table.insert(byOuter[best].holes, info[h].ring)
+		end
+	end
+	return polygons
+end
+
+return Regions
+]]></string>
+      </Properties>
+    </Item>
+    <Item class="ModuleScript" referent="6">
+      <Properties>
+        <string name="Name">SvgDocument</string>
+        <string name="Source"><![CDATA[-- Turns SVG source text into a flat list of filled shapes: flattened outlines in document
+-- coordinates plus a resolved fill color, opacity and fill rule.
+
+local Xml = if script then require(script.Parent.Xml) else require("./Xml")
+local Transform = if script then require(script.Parent.Transform) else require("./Transform")
+local PathData = if script then require(script.Parent.PathData) else require("./PathData")
+
+local SvgDocument = {}
+
+export type Shape = {
+	rings: { { { number } } },
+	fillRule: string,
+	color: { number },
+	alpha: number,
+	name: string?,
+}
+
+export type Result = {
+	shapes: { Shape },
+	warnings: { string },
+	size: number,
+}
+
+local NAMED_COLORS = {
+	black = "000000", white = "ffffff", red = "ff0000", green = "008000", lime = "00ff00",
+	blue = "0000ff", yellow = "ffff00", cyan = "00ffff", aqua = "00ffff", magenta = "ff00ff",
+	fuchsia = "ff00ff", gray = "808080", grey = "808080", silver = "c0c0c0", maroon = "800000",
+	olive = "808000", purple = "800080", teal = "008080", navy = "000080", orange = "ffa500",
+	pink = "ffc0cb", brown = "a52a2a", gold = "ffd700", indigo = "4b0082", violet = "ee82ee",
+	coral = "ff7f50", crimson = "dc143c", salmon = "fa8072", tomato = "ff6347", khaki = "f0e68c",
+	beige = "f5f5dc", tan = "d2b48c", chocolate = "d2691e", darkred = "8b0000", darkgreen = "006400",
+	darkblue = "00008b", darkgray = "a9a9a9", darkgrey = "a9a9a9", lightgray = "d3d3d3",
+	lightgrey = "d3d3d3", lightblue = "add8e6", skyblue = "87ceeb", steelblue = "4682b4",
+	royalblue = "4169e1", dodgerblue = "1e90ff", deepskyblue = "00bfff", turquoise = "40e0d0",
+	limegreen = "32cd32", forestgreen = "228b22", seagreen = "2e8b57", olivedrab = "6b8e23",
+	yellowgreen = "9acd32", orangered = "ff4500", darkorange = "ff8c00", hotpink = "ff69b4",
+	deeppink = "ff1493", plum = "dda0dd", orchid = "da70d6", lavender = "e6e6fa",
+	slategray = "708090", slategrey = "708090", dimgray = "696969", dimgrey = "696969",
+	whitesmoke = "f5f5f5", ivory = "fffff0", firebrick = "b22222", sienna = "a0522d",
+	peru = "cd853f", goldenrod = "daa520", midnightblue = "191970", darkviolet = "9400d3",
+	rebeccapurple = "663399", lightgreen = "90ee90", darkslategray = "2f4f4f",
+	darkslategrey = "2f4f4f", gainsboro = "dcdcdc", snow = "fffafa", mintcream = "f5fffa",
+}
+
+-- Elements whose contents never render directly.
+local SKIP = {
+	defs = true, clipPath = true, mask = true, symbol = true, marker = true, pattern = true,
+	linearGradient = true, radialGradient = true, style = true, title = true, desc = true,
+	metadata = true, filter = true, foreignObject = true, script = true, namedview = true,
+}
+
+local CONTAINERS = { g = true, svg = true, a = true, switch = true }
+local SHAPES = { path = true, rect = true, circle = true, ellipse = true, polygon = true, polyline = true }
+
+local INHERITED = {
+	"fill", "fill-opacity", "fill-rule", "visibility", "stroke", "stroke-width", "stroke-opacity", "color",
+}
+local PROPERTIES = {
+	"fill", "fill-opacity", "fill-rule", "visibility", "stroke", "stroke-width", "stroke-opacity", "color",
+	"opacity", "display",
+}
+
+local function trim(s: string): string
+	return (s:gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+local function firstNumber(s: string?): number?
+	if not s then
+		return nil
+	end
+	return Transform.numbers(s)[1]
+end
+
+local function parseOpacity(v: string?): number
+	if not v then
+		return 1
+	end
+	local pct = v:match("^%s*([%d%.]+)%%")
+	if pct then
+		return math.clamp((tonumber(pct) or 100) / 100, 0, 1)
+	end
+	return math.clamp(tonumber(trim(v)) or 1, 0, 1)
+end
+
+---------------------------------------------------------------------------------------------------
+-- Colors
+
+local function hexColor(h: string): (number?, number?, number?, number?)
+	if #h == 3 or #h == 4 then
+		local a = if #h == 4 then h:sub(4, 4) else "f"
+		local function ch(c)
+			return (tonumber(c .. c, 16) :: number) / 255
+		end
+		return ch(h:sub(1, 1)), ch(h:sub(2, 2)), ch(h:sub(3, 3)), ch(a)
+	elseif #h == 6 or #h == 8 then
+		local function ch(k)
+			return (tonumber(h:sub(k, k + 1), 16) :: number) / 255
+		end
+		return ch(1), ch(3), ch(5), if #h == 8 then ch(7) else 1
+	end
+	return nil
+end
+
+local function channel(v: string, max: number): number?
+	local pct = v:match("^([%d%.%-]+)%%$")
+	if pct then
+		local n = tonumber(pct)
+		return n and math.clamp(n / 100, 0, 1)
+	end
+	local n = tonumber(v)
+	return n and math.clamp(n / max, 0, 1)
+end
+
+local function hslToRgb(h: number, s: number, l: number): (number, number, number)
+	h = (h % 360) / 360
+	if s == 0 then
+		return l, l, l
+	end
+	local q = if l < 0.5 then l * (1 + s) else l + s - l * s
+	local p = 2 * l - q
+	local function hue(t)
+		t %= 1
+		if t < 1 / 6 then
+			return p + (q - p) * 6 * t
+		elseif t < 1 / 2 then
+			return q
+		elseif t < 2 / 3 then
+			return p + (q - p) * (2 / 3 - t) * 6
+		end
+		return p
+	end
+	return hue(h + 1 / 3), hue(h), hue(h - 1 / 3)
+end
+
+-- Returns r, g, b, a in 0..1, or nil for "none" or anything unparseable.
+local function parseColor(s: string): (number?, number?, number?, number?)
+	s = trim(s):lower()
+	local hex = s:match("^#(%x+)$")
+	if hex then
+		return hexColor(hex)
+	end
+	local fn, args = s:match("^(%a+)%s*%((.-)%)$")
+	if fn then
+		local parts = {}
+		for p in args:gsub("/", " "):gmatch("[^%s,]+") do
+			table.insert(parts, p)
+		end
+		if #parts < 3 then
+			return nil
+		end
+		local a = if parts[4] then channel(parts[4], 1) else 1
+		if fn == "rgb" or fn == "rgba" then
+			local r, g, b = channel(parts[1], 255), channel(parts[2], 255), channel(parts[3], 255)
+			if r and g and b and a then
+				return r, g, b, a
+			end
+		elseif fn == "hsl" or fn == "hsla" then
+			local h = tonumber((parts[1]:gsub("deg$", "")))
+			local sat, light = channel(parts[2], 100), channel(parts[3], 100)
+			if h and sat and light and a then
+				local r, g, b = hslToRgb(h, sat, light)
+				return r, g, b, a
+			end
+		end
+		return nil
+	end
+	local named = NAMED_COLORS[s]
+	if named then
+		return hexColor(named)
+	end
+	return nil
+end
+
+---------------------------------------------------------------------------------------------------
+-- CSS (<style> blocks with simple selectors, plus inline style attributes)
+
+local function parseDeclarations(s: string): { [string]: string }
+	local out = {}
+	for decl in s:gmatch("[^;]+") do
+		local k, v = decl:match("^%s*([%w%-]+)%s*:%s*(.-)%s*$")
+		if k and v then
+			out[k:lower()] = (v:gsub("%s*!important$", ""))
+		end
+	end
+	return out
+end
+
+type Selector = { tag: string?, id: string?, classes: { string }, spec: number }
+type Rule = { selector: Selector, decls: { [string]: string }, spec: number, order: number }
+
+local function compileSelector(sel: string): Selector?
+	if sel == "" or sel:find("[%s>+~%[:]") then
+		return nil -- combinators, attribute selectors and pseudo-classes are not supported
+	end
+	local tag = sel:match("^([%a][%w%-]*)")
+	if sel:sub(1, 1) == "*" then
+		tag = nil
+	end
+	local id = sel:match("#([%w%-_]+)")
+	local classes = {}
+	for c in sel:gmatch("%.([%w%-_]+)") do
+		table.insert(classes, c)
+	end
+	local spec = (if id then 100 else 0) + #classes * 10 + (if tag then 1 else 0)
+	return { tag = tag, id = id, classes = classes, spec = spec }
+end
+
+local function parseStylesheet(text: string): { Rule }
+	text = text:gsub("/%*.-%*/", "")
+	local rules: { Rule } = {}
+	local i = 1
+	while true do
+		local open = text:find("{", i, true)
+		if not open then
+			break
+		end
+		local selectorText = trim(text:sub(i, open - 1))
+		local depth, j = 1, open + 1
+		while j <= #text and depth > 0 do
+			local c = text:sub(j, j)
+			if c == "{" then
+				depth += 1
+			elseif c == "}" then
+				depth -= 1
+			end
+			j += 1
+		end
+		if selectorText:sub(1, 1) ~= "@" then
+			local decls = parseDeclarations(text:sub(open + 1, j - 2))
+			for sel in selectorText:gmatch("[^,]+") do
+				local compiled = compileSelector(trim(sel))
+				if compiled then
+					table.insert(rules, { selector = compiled, decls = decls, spec = compiled.spec, order = #rules + 1 })
+				end
+			end
+		end
+		i = j
+	end
+	table.sort(rules, function(a, b)
+		if a.spec ~= b.spec then
+			return a.spec < b.spec
+		end
+		return a.order < b.order
+	end)
+	return rules
+end
+
+local function selectorMatches(sel: Selector, node: Xml.Node): boolean
+	if sel.tag and sel.tag ~= node.tag then
+		return false
+	end
+	if sel.id and sel.id ~= node.attrs.id then
+		return false
+	end
+	if #sel.classes > 0 then
+		local have = {}
+		for c in (node.attrs.class or ""):gmatch("%S+") do
+			have[c] = true
+		end
+		for _, c in sel.classes do
+			if not have[c] then
+				return false
+			end
+		end
+	end
+	return true
+end
+
+---------------------------------------------------------------------------------------------------
+-- Basic shapes as path data
+
+local function fmt(...: number): string
+	local parts = {}
+	for k, v in { ... } do
+		parts[k] = string.format("%.10g", v)
+	end
+	return table.concat(parts, " ")
+end
+
+local function shapeToPathData(node: Xml.Node): string?
+	local a = node.attrs
+	local tag = node.tag
+	if tag == "path" then
+		return a.d
+	elseif tag == "rect" then
+		local x, y = firstNumber(a.x) or 0, firstNumber(a.y) or 0
+		local w, h = firstNumber(a.width) or 0, firstNumber(a.height) or 0
+		if w <= 0 or h <= 0 then
+			return nil
+		end
+		local rx, ry = firstNumber(a.rx), firstNumber(a.ry)
+		rx = rx or ry or 0
+		ry = ry or rx or 0
+		rx = math.clamp(rx :: number, 0, w / 2)
+		ry = math.clamp(ry :: number, 0, h / 2)
+		if rx <= 0 or ry <= 0 then
+			return "M" .. fmt(x, y) .. " H" .. fmt(x + w) .. " V" .. fmt(y + h) .. " H" .. fmt(x) .. " Z"
+		end
+		local corner = " A" .. fmt(rx, ry) .. " 0 0 1 "
+		return "M"
+			.. fmt(x + rx, y)
+			.. " H" .. fmt(x + w - rx)
+			.. corner .. fmt(x + w, y + ry)
+			.. " V" .. fmt(y + h - ry)
+			.. corner .. fmt(x + w - rx, y + h)
+			.. " H" .. fmt(x + rx)
+			.. corner .. fmt(x, y + h - ry)
+			.. " V" .. fmt(y + ry)
+			.. corner .. fmt(x + rx, y)
+			.. " Z"
+	elseif tag == "circle" or tag == "ellipse" then
+		local cx, cy = firstNumber(a.cx) or 0, firstNumber(a.cy) or 0
+		local rx, ry
+		if tag == "circle" then
+			rx = firstNumber(a.r) or 0
+			ry = rx
+		else
+			rx, ry = firstNumber(a.rx), firstNumber(a.ry)
+			rx = rx or ry or 0
+			ry = ry or rx or 0
+		end
+		if rx <= 0 or ry <= 0 then
+			return nil
+		end
+		local half = " A" .. fmt(rx, ry) .. " 0 1 0 "
+		return "M" .. fmt(cx - rx, cy) .. half .. fmt(cx + rx, cy) .. half .. fmt(cx - rx, cy) .. " Z"
+	elseif tag == "polygon" or tag == "polyline" then
+		local v = Transform.numbers(a.points or "")
+		if #v < 6 then
+			return nil
+		end
+		local parts = { "M" .. fmt(v[1], v[2]) }
+		for k = 3, #v - 1, 2 do
+			table.insert(parts, "L" .. fmt(v[k], v[k + 1]))
+		end
+		table.insert(parts, "Z")
+		return table.concat(parts, " ")
+	end
+	return nil
+end
+
+---------------------------------------------------------------------------------------------------
+
+-- quality: curve tolerance as a fraction of the document's size (smaller = smoother).
+function SvgDocument.load(source: string, quality: number, sizeOverride: number?): Result
+	local docRoot = Xml.parse(source)
+	local svg = Xml.findFirst(docRoot, "svg")
+	if not svg then
+		error("This file has no <svg> element.", 0)
+	end
+
+	local warningCounts: { [string]: number } = {}
+	local warningOrder: { string } = {}
+	local function warn(message: string)
+		if not warningCounts[message] then
+			table.insert(warningOrder, message)
+			warningCounts[message] = 0
+		end
+		warningCounts[message] += 1
+	end
+
+	-- Index ids and gather every <style> block.
+	local byId: { [string]: Xml.Node } = {}
+	local cssText = {}
+	Xml.walk(svg, function(node)
+		if node.attrs.id then
+			byId[node.attrs.id] = node
+		end
+		if node.tag == "style" then
+			table.insert(cssText, node.text)
+		end
+	end)
+	local rules = parseStylesheet(table.concat(cssText, "\n"))
+
+	-- Document size, used to pick a curve tolerance.
+	local size = sizeOverride
+	if not size then
+		local vb = Transform.numbers(svg.attrs.viewBox or "")
+		if #vb >= 4 and vb[3] > 0 and vb[4] > 0 then
+			size = math.max(vb[3], vb[4])
+		else
+			local w, h = firstNumber(svg.attrs.width), firstNumber(svg.attrs.height)
+			if w and h and w > 0 and h > 0 then
+				size = math.max(w, h)
+			end
+		end
+	end
+	if not size then
+		-- No declared size: do a coarse pass to measure the drawing, then reparse.
+		local coarse = SvgDocument.load(source, 1, 1000)
+		local minX, minY, maxX, maxY = math.huge, math.huge, -math.huge, -math.huge
+		for _, shape in coarse.shapes do
+			for _, ring in shape.rings do
+				for _, p in ring do
+					minX, maxX = math.min(minX, p[1]), math.max(maxX, p[1])
+					minY, maxY = math.min(minY, p[2]), math.max(maxY, p[2])
+				end
+			end
+		end
+		size = if maxX > minX then math.max(maxX - minX, maxY - minY) else 100
+	end
+	local baseTol = (size :: number) * quality
+
+	local function computeStyle(node: Xml.Node, parent: { [string]: string }): { [string]: string }
+		local style = {}
+		for _, k in INHERITED do
+			style[k] = parent[k]
+		end
+		for _, k in PROPERTIES do
+			local v = node.attrs[k]
+			if v then
+				style[k] = trim(v)
+			end
+		end
+		for _, rule in rules do
+			if selectorMatches(rule.selector, node) then
+				for k, v in rule.decls do
+					style[k] = v
+				end
+			end
+		end
+		if node.attrs.style then
+			for k, v in parseDeclarations(node.attrs.style) do
+				style[k] = v
+			end
+		end
+		for k, v in style do
+			if v == "inherit" then
+				style[k] = parent[k]
+			end
+		end
+		return style
+	end
+
+	local function gradientColor(id: string): (number?, number?, number?, number?)
+		local node = byId[id]
+		local hops = 0
+		while node and hops < 8 do
+			if node.tag ~= "linearGradient" and node.tag ~= "radialGradient" then
+				return nil
+			end
+			local stops = {}
+			for _, child in node.children do
+				if child.tag == "stop" then
+					table.insert(stops, child)
+				end
+			end
+			if #stops > 0 then
+				local r, g, b, a, count = 0, 0, 0, 0, 0
+				for _, stop in stops do
+					local st = computeStyle(stop, {})
+					local sr, sg, sb, sa = parseColor(st["stop-color"] or stop.attrs["stop-color"] or "black")
+					if sr then
+						r += sr :: number
+						g += sg :: number
+						b += sb :: number
+						a += (sa :: number) * parseOpacity(st["stop-opacity"] or stop.attrs["stop-opacity"])
+						count += 1
+					end
+				end
+				if count == 0 then
+					return nil
+				end
+				return r / count, g / count, b / count, a / count
+			end
+			local href = node.attrs.href or node.attrs["xlink:href"]
+			node = href and byId[href:match("^#(.+)") or ""]
+			hops += 1
+		end
+		return nil
+	end
+
+	-- Returns r, g, b, a for a fill value, or nil when nothing should be drawn.
+	local function resolvePaint(value: string, style: { [string]: string }): (number?, number?, number?, number?)
+		value = trim(value)
+		local lower = value:lower()
+		if lower == "none" or lower == "transparent" then
+			return nil
+		end
+		if lower:sub(1, 4) == "url(" then
+			local id = value:match("^url%(%s*['\"]?#([^'\"%)%s]+)")
+			if id then
+				local r, g, b, a = gradientColor(id)
+				if r then
+					warn("Gradients were flattened to their average color.")
+					return r, g, b, a
+				end
+			end
+			local fallback = value:match("%)%s*(.+)$")
+			if fallback then
+				return resolvePaint(fallback, style)
+			end
+			warn("Some fills use patterns or unknown paint servers; they were drawn black.")
+			return 0, 0, 0, 1
+		end
+		if lower == "currentcolor" then
+			local r, g, b, a = parseColor(style.color or "black")
+			if r then
+				return r, g, b, a
+			end
+			return 0, 0, 0, 1
+		end
+		local r, g, b, a = parseColor(value)
+		if not r then
+			warn(("Unrecognized color %q was drawn black."):format(value))
+			return 0, 0, 0, 1
+		end
+		return r, g, b, a
+	end
+
+	local shapes: { Shape } = {}
+
+	local function emitShape(node: Xml.Node, matrix: Transform.Matrix, style: { [string]: string }, opacity: number)
+		if style.visibility == "hidden" or style.visibility == "collapse" then
+			return
+		end
+		local stroke = style.stroke
+		if stroke and trim(stroke) ~= "none" and (firstNumber(style["stroke-width"]) or 1) > 0 then
+			warn("Strokes (outlines) are skipped. Use Outline Stroke / Stroke to Path in your editor to keep them.")
+		end
+		local r, g, b, a = resolvePaint(style.fill or "black", style)
+		if not r then
+			return
+		end
+		local alpha = (a :: number) * parseOpacity(style["fill-opacity"]) * opacity
+		if alpha <= 0.001 then
+			return
+		end
+		local d = shapeToPathData(node)
+		if not d then
+			return
+		end
+		local tol = baseTol / Transform.scaleFactor(matrix)
+		local subpaths, err = PathData.parse(d, tol)
+		if err then
+			warn("Some path data was malformed; shapes were kept up to the error (" .. err .. ").")
+		end
+		if #subpaths == 0 then
+			return
+		end
+		for _, sub in subpaths do
+			for k, p in sub do
+				local x, y = Transform.apply(matrix, p[1], p[2])
+				sub[k] = { x, y }
+			end
+		end
+		table.insert(shapes, {
+			rings = subpaths,
+			fillRule = if trim(style["fill-rule"] or ""):lower() == "evenodd" then "evenodd" else "nonzero",
+			color = { r :: number, g :: number, b :: number },
+			alpha = alpha,
+			name = node.attrs.id,
+		})
+	end
+
+	local function walk(node: Xml.Node, matrix: Transform.Matrix, parentStyle: { [string]: string }, opacity: number, depth: number)
+		local tag = node.tag
+		if SKIP[tag] or depth > 64 then
+			return
+		end
+		local style = computeStyle(node, parentStyle)
+		if style.display and trim(style.display) == "none" then
+			return
+		end
+		local m = matrix
+		if tag == "svg" and node ~= svg then
+			m = Transform.multiply(m, Transform.translate(firstNumber(node.attrs.x) or 0, firstNumber(node.attrs.y) or 0))
+		end
+		if node.attrs.transform then
+			m = Transform.multiply(m, Transform.parse(node.attrs.transform))
+		end
+		local op = opacity * parseOpacity(style.opacity)
+
+		if CONTAINERS[tag] then
+			for _, child in node.children do
+				walk(child, m, style, op, depth + 1)
+			end
+		elseif tag == "use" then
+			local href = node.attrs.href or node.attrs["xlink:href"]
+			local target = href and byId[href:match("^#(.+)") or ""]
+			if target then
+				local um = Transform.multiply(m, Transform.translate(firstNumber(node.attrs.x) or 0, firstNumber(node.attrs.y) or 0))
+				if target.tag == "symbol" then
+					local symbolStyle = computeStyle(target, style)
+					if target.attrs.transform then
+						um = Transform.multiply(um, Transform.parse(target.attrs.transform))
+					end
+					for _, child in target.children do
+						walk(child, um, symbolStyle, op, depth + 1)
+					end
+				else
+					walk(target, um, style, op, depth + 1)
+				end
+			end
+		elseif SHAPES[tag] then
+			emitShape(node, m, style, op)
+		elseif tag == "text" then
+			warn("Text is skipped. Convert text to paths (Create Outlines / Object to Path) before exporting.")
+		elseif tag == "image" then
+			warn("Embedded images are skipped.")
+		end
+	end
+
+	walk(svg, Transform.identity(), {}, 1, 0)
+
+	local warnings = {}
+	for _, message in warningOrder do
+		local count = warningCounts[message]
+		table.insert(warnings, if count > 1 then ("%s (x%d)"):format(message, count) else message)
+	end
+
+	return { shapes = shapes, warnings = warnings, size = size :: number }
+end
+
+SvgDocument.parseColor = parseColor
+
+return SvgDocument
+]]></string>
+      </Properties>
+    </Item>
+    <Item class="ModuleScript" referent="7">
+      <Properties>
+        <string name="Name">Transform</string>
+        <string name="Source"><![CDATA[-- 2D affine matrices in SVG order {a, b, c, d, e, f}:
+--   x' = a*x + c*y + e
+--   y' = b*x + d*y + f
+
+local Transform = {}
+
+export type Matrix = { number }
+
+function Transform.identity(): Matrix
+	return { 1, 0, 0, 1, 0, 0 }
+end
+
+function Transform.translate(tx: number, ty: number): Matrix
+	return { 1, 0, 0, 1, tx, ty }
+end
+
+-- Returns m * n (n is applied first).
+function Transform.multiply(m: Matrix, n: Matrix): Matrix
+	return {
+		m[1] * n[1] + m[3] * n[2],
+		m[2] * n[1] + m[4] * n[2],
+		m[1] * n[3] + m[3] * n[4],
+		m[2] * n[3] + m[4] * n[4],
+		m[1] * n[5] + m[3] * n[6] + m[5],
+		m[2] * n[5] + m[4] * n[6] + m[6],
+	}
+end
+
+function Transform.apply(m: Matrix, x: number, y: number): (number, number)
+	return m[1] * x + m[3] * y + m[5], m[2] * x + m[4] * y + m[6]
+end
+
+-- Average linear scale of the matrix, used to keep curve tolerance constant in document space.
+function Transform.scaleFactor(m: Matrix): number
+	local det = math.abs(m[1] * m[4] - m[2] * m[3])
+	return if det > 1e-12 then math.sqrt(det) else 1
+end
+
+-- Pulls every number out of a string such as "10,20 -3.5e2.5".
+function Transform.numbers(s: string): { number }
+	local out = {}
+	local i, n = 1, #s
+	while i <= n do
+		local st, e = s:find("^[%+%-]?%d*%.?%d+[eE][%+%-]?%d+", i)
+		if not st then
+			st, e = s:find("^[%+%-]?%d*%.?%d+", i)
+		end
+		if st then
+			table.insert(out, tonumber(s:sub(st, e)) :: number)
+			i = e + 1
+		else
+			i += 1
+		end
+	end
+	return out
+end
+
+function Transform.parse(s: string): Matrix
+	local result = Transform.identity()
+	for name, args in s:gmatch("([%a]+)%s*%(([^%)]*)%)") do
+		local v = Transform.numbers(args)
+		local m
+		if name == "matrix" and #v >= 6 then
+			m = { v[1], v[2], v[3], v[4], v[5], v[6] }
+		elseif name == "translate" and #v >= 1 then
+			m = Transform.translate(v[1], v[2] or 0)
+		elseif name == "scale" and #v >= 1 then
+			m = { v[1], 0, 0, v[2] or v[1], 0, 0 }
+		elseif name == "rotate" and #v >= 1 then
+			local a = math.rad(v[1])
+			local cos, sin = math.cos(a), math.sin(a)
+			m = { cos, sin, -sin, cos, 0, 0 }
+			if #v >= 3 then
+				m = Transform.multiply(
+					Transform.translate(v[2], v[3]),
+					Transform.multiply(m, Transform.translate(-v[2], -v[3]))
+				)
+			end
+		elseif name == "skewX" and #v >= 1 then
+			m = { 1, 0, math.tan(math.rad(v[1])), 1, 0, 0 }
+		elseif name == "skewY" and #v >= 1 then
+			m = { 1, math.tan(math.rad(v[1])), 0, 1, 0, 0 }
+		end
+		if m then
+			result = Transform.multiply(result, m)
+		end
+	end
+	return result
+end
+
+return Transform
+]]></string>
+      </Properties>
+    </Item>
+    <Item class="ModuleScript" referent="8">
+      <Properties>
+        <string name="Name">Xml</string>
+        <string name="Source"><![CDATA[-- Minimal XML parser: enough for SVG files exported by Illustrator, Inkscape, Figma and Affinity.
+-- Handles comments, CDATA, processing instructions and DOCTYPEs with internal subsets.
+
+local Xml = {}
+
+export type Node = {
+	tag: string,
+	attrs: { [string]: string },
+	children: { Node },
+	text: string,
+}
+
+local ENTITIES = { amp = "&", lt = "<", gt = ">", quot = '"', apos = "'" }
+
+local function decodeEntities(s: string): string
+	return (s:gsub("&(#?x?)(%w+);", function(prefix, body)
+		local code
+		if prefix == "#" then
+			code = tonumber(body)
+		elseif prefix == "#x" then
+			code = tonumber(body, 16)
+		elseif prefix == "" then
+			return ENTITIES[body]
+		end
+		if code and code >= 0 and code <= 0x10FFFF then
+			return utf8.char(code)
+		end
+		return nil
+	end))
+end
+
+-- "svg:path" -> "path"
+local function localName(name: string): string
+	return name:match(":([^:]+)$") or name
+end
+
+function Xml.parse(src: string): Node
+	if src:sub(1, 3) == "\239\187\191" then
+		src = src:sub(4)
+	end
+
+	local root: Node = { tag = "#document", attrs = {}, children = {}, text = "" }
+	local stack = { root }
+	local pos = 1
+	local len = #src
+
+	while pos <= len do
+		local top = stack[#stack]
+		local lt = src:find("<", pos, true)
+		if not lt then
+			top.text ..= decodeEntities(src:sub(pos))
+			break
+		end
+		if lt > pos then
+			top.text ..= decodeEntities(src:sub(pos, lt - 1))
+		end
+
+		if src:sub(lt, lt + 3) == "<!--" then
+			local e = src:find("-->", lt + 4, true)
+			pos = if e then e + 3 else len + 1
+		elseif src:sub(lt, lt + 8) == "<![CDATA[" then
+			-- Built from pieces: a literal CDATA terminator breaks the plugin's .rbxmx encoding.
+			local e = src:find("]]" .. ">", lt + 9, true)
+			top.text ..= src:sub(lt + 9, (e or len + 1) - 1)
+			pos = if e then e + 3 else len + 1
+		elseif src:sub(lt, lt + 1) == "<?" then
+			local e = src:find("?>", lt + 2, true)
+			pos = if e then e + 2 else len + 1
+		elseif src:sub(lt, lt + 1) == "<!" then
+			-- DOCTYPE, possibly with an internal [ ... ] subset (Illustrator uses one for entity namespaces)
+			local i = lt + 2
+			local depth = 0
+			while i <= len do
+				local c = src:sub(i, i)
+				if c == "[" then
+					depth += 1
+				elseif c == "]" then
+					depth -= 1
+				elseif c == ">" and depth <= 0 then
+					break
+				end
+				i += 1
+			end
+			pos = i + 1
+		elseif src:sub(lt, lt + 1) == "</" then
+			local e = src:find(">", lt + 2, true) or len
+			local name = src:sub(lt + 2, e - 1):match("^%s*([^%s>]+)")
+			if name then
+				name = localName(name)
+				-- Pop back to the matching open tag; tolerates sloppy nesting.
+				for i = #stack, 2, -1 do
+					if stack[i].tag == name then
+						for _ = #stack, i, -1 do
+							table.remove(stack)
+						end
+						break
+					end
+				end
+			end
+			pos = e + 1
+		else
+			local _, nameEnd, name = src:find("^([%w_:%.%-]+)", lt + 1)
+			if not name then
+				top.text ..= "<"
+				pos = lt + 1
+			else
+				local node: Node = { tag = localName(name), attrs = {}, children = {}, text = "" }
+				local i = nameEnd + 1
+				local selfClosing = false
+				while i <= len do
+					local _, wsEnd = src:find("^%s*", i)
+					i = wsEnd + 1
+					local c = src:sub(i, i)
+					if c == "" then
+						break
+					elseif c == ">" then
+						i += 1
+						break
+					elseif src:sub(i, i + 1) == "/>" then
+						selfClosing = true
+						i += 2
+						break
+					end
+					local _, attrEnd, attrName = src:find("^([^%s=/>]+)", i)
+					if not attrName then
+						i += 1
+						continue
+					end
+					i = attrEnd + 1
+					local _, eqEnd = src:find("^%s*=%s*", i)
+					if eqEnd then
+						i = eqEnd + 1
+						local quote = src:sub(i, i)
+						local value
+						if quote == '"' or quote == "'" then
+							local close = src:find(quote, i + 1, true) or len + 1
+							value = src:sub(i + 1, close - 1)
+							i = close + 1
+						else
+							local _, valueEnd, v = src:find("^([^%s>]*)", i)
+							value = v
+							i = valueEnd + 1
+						end
+						node.attrs[attrName] = decodeEntities(value)
+					else
+						node.attrs[attrName] = ""
+					end
+				end
+				table.insert(top.children, node)
+				if not selfClosing then
+					table.insert(stack, node)
+				end
+				pos = i
+			end
+		end
+	end
+
+	return root
+end
+
+-- Depth-first search for the first element with the given tag.
+function Xml.findFirst(node: Node, tag: string): Node?
+	if node.tag == tag then
+		return node
+	end
+	for _, child in node.children do
+		local found = Xml.findFirst(child, tag)
+		if found then
+			return found
+		end
+	end
+	return nil
+end
+
+function Xml.walk(node: Node, visit: (Node) -> ())
+	visit(node)
+	for _, child in node.children do
+		Xml.walk(child, visit)
+	end
+end
+
+return Xml
+]]></string>
+      </Properties>
+    </Item>
+  </Item>
+</roblox>
